@@ -332,6 +332,10 @@ struct Ring {
                          // read failed (FNX_NGRAM=disk, verify's ngram_wait_copy_k)
     bool f32 = false;    // fp32 words (buffers sized for them) instead of fp16 pairs
     int rows = MAXT;     // the row capacity the buffers were sized for
+    // FNX_RING3=1 (decode's ring, ring3() in engine.hpp): words of three fp16 values and a 16-bit tag, a third fewer
+    // than two values and a 32-bit tag, the same sums bit for bit; the engine zeroes the buffers each 128 tags
+    // (Engine::tags_room), as a 16-bit tag wraps every 256
+    bool r3 = false;
     // a ring for chunk-sized sums (plain fp16 words and a flag per block and hop): this card's flags and the next's
     unsigned* flags = nullptr;
     unsigned* next_flags = nullptr;

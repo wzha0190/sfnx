@@ -33,6 +33,9 @@ BatchDrafts batch_drafts();
 // FNX_RING_F32: decode's sums between cards as fp32 (true) or fp16 pairs; fp16 pairs by default.
 // Read at each call (an Engine reads it when it is made; the lab's identity records reads it too); not 0 or 1 throws
 bool ring_f32();
+// FNX_RING3=1: decode's sums in words of three fp16 values and a 16-bit tag (Ring::r3), the same sums bit for bit as
+// the default's two a word. Read at each call like ring_f32; not 0 or 1, or 1 with FNX_RING_F32=1, throws
+bool ring3();
 // FNX_ROPE_SCALE=S: YaRN over the trained length, so the context can reach trained x S; 0 when it is not set or 1.
 // Read at each call like ring_f32 (the Engine and the lab's identity record); anything else not above 1 throws
 double rope_scale();
@@ -203,6 +206,7 @@ private:
     // a ring word carries tag * 256 + call + 1 in 32 bits, so tags stay below TAG_END: the tag that would reach it
     // clears every ring buffer (all cards idle) and the tags start again from 1. FNX_RING_TAG_START presets tag_max_
     static constexpr unsigned TAG_END = 1u << 24;
+    bool ring3_ = false;   // ring3(), read once at construction: its 16-bit tags need tags_room's zeroing each 128 tags
     void tags_room(unsigned n);
     void clear_rings();
     void pf_clear_ring(int c);   // card c's prompt ring (prefill.cu), when it has buffers of its own
