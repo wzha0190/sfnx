@@ -50,7 +50,27 @@ included: the most any exchange could give back.
 | `FNX_PF_PASS=2` | the same as 4 (3,256, 4,038, 3,955 tok/s) |
 | `FNX_PF_PASS=8` | 0.4–1.5% slower, and 407 more experts to RAM for VRAM |
 
-So on one socket the defaults stand: the ring, two values a word, copy engines one way for prompts. On the reference
+## Drafts and batching
+
+Lab decode at prod's settings (tok/s; edit1, code1, prose2):
+
+| Setting | Result |
+| --- | --- |
+| `--spec` 6 (prod), `--lookup` 15 (prod) | 397.1, 184.6, 142.4 |
+| `--spec` 4 / 8 / 10 / 12 | within 2%: 389.9–397.7, 184.6–187.8, 142.4–142.7. Prose stays at 2.14 tokens a round: acceptance limits it, not the chain's length |
+| `--lookup` 8 / 12 | edit1 359.4 / 376.7, the rest the same |
+| `FNX_DRAFT_SAMPLE=0` / `FNX_DRAFT_PEN=0` | prose2 137.0 / 140.8 |
+| `FNX_HC1` 0 / 5 / 8 | the same as 3 |
+
+Prose2 with the chain fixed (`FNX_DRAFT_ADAPT=0`, no lookup drafts) took 12.10, 14.32, 16.33 and 17.94 ms a round at
+1–4 drafts, against the 12.47, 14.76, 16.60 and 18.34 that `Session::generate`'s cost constants were measured from: the
+chooser's model holds on this box, and adaptive (142.4 tok/s) matches the best fixed length (2 drafts, 142.8).
+
+Six lanes (`bdecode 6 512`): 313.4 tok/s overall at the default `FNX_BATCH_HORIZON` 4, 322.7 at 2 (one pass each),
+306.9 at 8, 304.7 at 16; lookup-only batch drafts 313.6. Each V100's power limit is already its maximum, 250 W.
+
+So on one socket the defaults stand: the ring, two values a word, copy engines one way for prompts, prod's drafts and
+batch plan. On the reference
 suite (`docs/benchmarks.md`'s scripts) the box measured level with the two-socket one to 12% ahead (six lanes level,
 code edit 2–6%, cold reads 4–6%, a warm turn's first token 12%), from the faster links inside each round; the cards'
 own kernels are the rest.
