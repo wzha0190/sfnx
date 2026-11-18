@@ -1,0 +1,23 @@
+diff --git a/src/kernels.cu b/src/kernels.cu
+--- a/src/kernels.cu
++++ b/src/kernels.cu
+@@ -1432,4 +1432,15 @@
+-    const int grid = std::max(4, std::min(T > MAXT ? 240 : 40, (T * NP / NCARD + 255) / 256));
+-    if (r.f32) k_ring<true><<<grid, 256, 0, (cudaStream_t) st>>>(r, x, T, tag, call, m);
+-    else k_ring<false><<<grid, 256, 0, (cudaStream_t) st>>>(r, x, T, tag, call, m);
++    int threads = 256, cap = T > MAXT ? 240 : 40;
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++    // 2026-11-18: spread the short graph's independent ring lanes
++    // over more of the V100's SMs; leave the prompt ring alone.
++    if (T <= MAXT) {
++        static const long long requested = env_int("FNX_RM400_RING_THREADS", 256);
++        if (requested != 64 && requested != 128 && requested != 256)
++            throw std::runtime_error("FNX_RM400_RING_THREADS: expected 64, 128, or 256");
++        threads = requested;
++        if (threads != 256) cap = 80;
++    }
++#endif
++    const int grid = std::max(4, std::min(cap, (T * NP / NCARD + threads - 1) / threads));
++    if (r.f32) k_ring<true><<<grid, threads, 0, (cudaStream_t) st>>>(r, x, T, tag, call, m);
++    else k_ring<false><<<grid, threads, 0, (cudaStream_t) st>>>(r, x, T, tag, call, m);
+     ck_launch("ring_sum");

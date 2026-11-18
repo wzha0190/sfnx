@@ -1,0 +1,93 @@
+diff --git a/src/engine.cu b/src/engine.cu
+--- a/src/engine.cu
++++ b/src/engine.cu
+@@ -1200,3 +1200,3 @@
+                     const GdnLanes gl{rec + (size_t) l * MAXT + g.s0, rec + (size_t) (NL + l) * MAXT + g.s0, b.seg_ctl[(size_t) T] + g.s0,
+-                                      b.seg_row0[(size_t) T] + g.s0, b.snap[l], b.hsnap[l]};
++                                      b.seg_row0[(size_t) T] + g.s0, b.snap[l], b.hsnap[l], false, compact_snapshots_};
+                     gdn_core_segs(b.qkvz, b.ab, L.conv, L.dt_bias, L.ssm_a, L.ssm_norm, b.xq, b.gdn_scratch, w.nk, nv, w.vmap, gl, g.n,
+diff --git a/src/gdn_core.cuh b/src/gdn_core.cuh
+--- a/src/gdn_core.cuh
++++ b/src/gdn_core.cuh
+@@ -19,1 +19,3 @@
+ constexpr int GDN_UPDATE = 1 + 2 * HS;
++// A compact update fits in one of the original full-state slots, so
++// segment-local writes cannot overwrite another lane's reserved rows.
++static_assert(GDN_UPDATE <= HS * HS, "compact updates must fit inside each segment");
+diff --git a/src/engine_common.cu b/src/engine_common.cu
+--- a/src/engine_common.cu
++++ b/src/engine_common.cu
+@@ -554,8 +554,11 @@
+                 if (is_attn(l)) continue;
+-                jobs[k++] = {b.S[l], b.snap[l] + (compact_snapshots_ ? 0 : (size_t) (n - 1) * w.nv() * HS * HS), sbytes};
++                if (compact_snapshots_)
++                    jobs[k++] = {b.S[l], b.snap[l], sbytes, n, w.nv()};
++                else
++                    jobs[k++] = {b.S[l], b.snap[l] + (size_t) (n - 1) * w.nv() * HS * HS, sbytes};
+                 jobs[k++] = {b.chist[l] + wrote * hfloats, b.hsnap[l] + (size_t) (n - 1) * hfloats, hfloats * 4};
+             }
+-            // Each recurrent layer contributed one state job followed by one history job.
+-            const int recurrent_jobs = k;
+             k += hist_jobs(jobs + k, b, nullptr, (size_t) (n - 1));
+@@ -566,2 +567,2 @@
+-            if (compact_snapshots_ && n > 1) replay_gdn_many(b.commit_jobs, k, recurrent_jobs, n, w.nv(), b.st);
++            if (compact_snapshots_ && n > 1) replay_gdn_many(b.commit_jobs, k, b.st);
+             else copy_many(b.commit_jobs, k, b.st);
+@@ -1177,4 +1178,9 @@
+                     if (is_attn(l)) continue;
+-                    jobs[k++] = {LD.S[(size_t) l], b.snap[l] + at * sfloats, sfloats * 4};
++                    // A segment stores its full checkpoint at its first row.
++                    // Compact updates fit in that lane's existing reserved rows.
++                    if (compact_snapshots_)
++                        jobs[k++] = {LD.S[(size_t) l], b.snap[l] + (size_t) sg.r0[(size_t) i] * sfloats,
++                                     sfloats * sizeof(float), keep[i], cw.nv()};
++                    else
++                        jobs[k++] = {LD.S[(size_t) l], b.snap[l] + at * sfloats, sfloats * 4};
+                     jobs[k++] = {LD.chist[(size_t) l] + wrote * hfloats, b.hsnap[l] + at * hfloats, hfloats * 4};
+@@ -1189,1 +1195,2 @@
+-            copy_many(b.rows_commit_jobs, k, b.st);
++            if (compact_snapshots_) replay_gdn_many(b.rows_commit_jobs, k, b.st);
++            else copy_many(b.rows_commit_jobs, k, b.st);
+diff --git a/src/kernels.hpp b/src/kernels.hpp
+--- a/src/kernels.hpp
++++ b/src/kernels.hpp
+@@ -382,6 +382,7 @@
+     size_t bytes;
++    int replay_keep = 0, replay_heads = 0;  // nonzero for compact recurrent state jobs only
+ };
+ void copy_many(const CopyJob* jobs, int n, void* st);
+-// As copy_many; even jobs in [0, recurrent_jobs) replay the requested
+-// prefix of compact recurrent updates from their row-0 state.
+-void replay_gdn_many(const CopyJob* jobs, int n, int recurrent_jobs, int keep, int nv, void* st);
++// As copy_many; a tagged state job replays its own accepted prefix.
++void replay_gdn_many(const CopyJob* jobs, int n, void* st);
+diff --git a/src/kernels.cu b/src/kernels.cu
+--- a/src/kernels.cu
++++ b/src/kernels.cu
+@@ -1511,7 +1511,9 @@
+-__global__ void k_copy_many(const CopyJob* jobs, int recurrent_jobs, int keep, int nv) {
++__global__ void k_copy_many(const CopyJob* jobs) {
+     const CopyJob j = jobs[blockIdx.y];
+     float4* d = reinterpret_cast<float4*>(j.dst);
+     const float4* s = reinterpret_cast<const float4*>(j.src);
+     if constexpr (REPLAY) {
+-        if (blockIdx.y < recurrent_jobs && !(blockIdx.y & 1)) {
++        if (j.replay_keep > 1) {
++            const int nv = j.replay_heads;
+             const float* updates = reinterpret_cast<const float*>(s) + (size_t) nv * HS * HS;
+@@ -1522,1 +1524,1 @@
+-                for (int t = 1; t < keep; ++t) {
++                for (int t = 1; t < j.replay_keep; ++t) {
+@@ -1542,8 +1544,7 @@
+-    k_copy_many<false><<<dim3(8, n), 256, 0, (cudaStream_t) st>>>(jobs, 0, 0, 0);
++    k_copy_many<false><<<dim3(8, n), 256, 0, (cudaStream_t) st>>>(jobs);
+     ck_launch("copy_many");
+ }
+ 
+-void replay_gdn_many(const CopyJob* jobs, int n, int recurrent_jobs, int keep, int nv, void* st) {
+-    if (n <= 0 || keep <= 1 || recurrent_jobs > n || nv <= 0)
+-        throw std::runtime_error("replay_gdn_many: invalid commit shape");
+-    k_copy_many<true><<<dim3(8, n), 256, 0, (cudaStream_t) st>>>(jobs, recurrent_jobs, keep, nv);
++void replay_gdn_many(const CopyJob* jobs, int n, void* st) {
++    if (n <= 0) return;
++    k_copy_many<true><<<dim3(8, n), 256, 0, (cudaStream_t) st>>>(jobs);

@@ -1,0 +1,14 @@
+diff --git a/src/kernels.cu b/src/kernels.cu
+--- a/src/kernels.cu
++++ b/src/kernels.cu
+@@ -2139,4 +2139,11 @@
+         if (rows >= 8192) q8s_launch<4, SEG>(g, rows, cols, yq, T, s);
+ #endif
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++        // 2026-11-18: mid-size recurrent and output projections have
++        // enough CTAs to test reusing each activation across two rows.
++        else if (rows >= 2048 && T >= 3 && T <= 8 && env_flag("FNX_RM400_Q8S_MID_TILE"))
++            q8s_launch<2, SEG>(g, rows, cols, yq, T, s);
++#endif
+         else if (rows >= 4096) q8s_launch<2, SEG>(g, rows, cols, yq, T, s);
+         else q8s_launch<1, SEG>(g, rows, cols, yq, T, s);
