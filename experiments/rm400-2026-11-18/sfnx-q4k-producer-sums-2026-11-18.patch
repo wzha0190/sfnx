@@ -1,0 +1,154 @@
+diff --git a/src/engine_impl.hpp b/src/engine_impl.hpp
+--- a/src/engine_impl.hpp
++++ b/src/engine_impl.hpp
+@@ -36,1 +36,2 @@
+     void* xq;   // q8_1 rows
++    int16_t* q4k_sums = nullptr;   // exact integer sums of HC's FFN activation blocks
+diff --git a/src/engine.cu b/src/engine.cu
+--- a/src/engine.cu
++++ b/src/engine.cu
+@@ -203,2 +203,6 @@
+         b->sh_hq = dalloc<uint8_t>((size_t) MAXT * q8_1_bytes(ffs));
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++        if (env_flag("FNX_RM400_PRODUCER_SUMS"))
++            b->q4k_sums = dalloc<int16_t>((size_t) MAXT * (N / 32));
++#endif
+         if (!std::getenv("FNX_NO_TWIN")) {
+@@ -952,2 +956,4 @@
+     const int P = T * TOPK, ffs = w.ff1 - w.ff0;
+-    hc_read(R, b.bo_a, b.inj_a, L.hc_norm[1], L.hc_down[1], L.hc_up[1], L.hc_inj[1], m_.eps, b.mixed, b.inj_f, b.hcs, b.ring.err, T, b.st, b.xq);
++    int16_t* const q4k_sums = L.gu_e.type == T_Q4_K ? b.q4k_sums : nullptr;
++    hc_read(R, b.bo_a, b.inj_a, L.hc_norm[1], L.hc_down[1], L.hc_up[1], L.hc_inj[1], m_.eps, b.mixed, b.inj_f, b.hcs, b.ring.err,
++            T, b.st, b.xq, q4k_sums);
+@@ -987,2 +993,5 @@
+-    if (sh_in) moe_gate_up(L.gu_e, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st, &L.sh_down.s, ffs, b.sh_gu, b.part + (size_t) P * N);
+-    else moe_gate_up(L.gu_e, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st);
++    if (sh_in)
++        moe_gate_up(L.gu_e, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st, &L.sh_down.s, ffs, b.sh_gu,
++                    b.part + (size_t) P * N, q4k_sums);
++    else
++        moe_gate_up(L.gu_e, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st, nullptr, 0, nullptr, nullptr, q4k_sums);
+diff --git a/src/kernels.hpp b/src/kernels.hpp
+--- a/src/kernels.hpp
++++ b/src/kernels.hpp
+@@ -66,1 +66,1 @@
+-             int T, void* st, void* q8 = nullptr);
++             int T, void* st, void* q8 = nullptr, int16_t* q4k_sums = nullptr);
+@@ -285,1 +285,2 @@
+-                 const Q8S* sh_down = nullptr, int sh_ffs = 0, const float* sh_gu = nullptr, float* sh_out = nullptr);
++                 const Q8S* sh_down = nullptr, int sh_ffs = 0, const float* sh_gu = nullptr, float* sh_out = nullptr,
++                 const int16_t* q4k_sums = nullptr);
+diff --git a/src/hc.cuh b/src/hc.cuh
+--- a/src/hc.cuh
++++ b/src/hc.cuh
+@@ -55,2 +55,3 @@
+     float* td = nullptr;
++    int16_t* q4k_sums = nullptr;   // opt-in, one exact code sum per q8_1 block
+ };
+@@ -384,1 +385,9 @@
+         if (lane == 0) yq.ds = make_half2(__float2half(dq), __float2half(sm));
++        if (a.q4k_sums) {
++            int sum = qv;
++#pragma unroll
++            for (int bit = 16; bit; bit >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, bit);
++            if (lane == 0)
++                a.q4k_sums[(size_t) warp * (N / 32) + b] = static_cast<int16_t>(sum);
++        }
+diff --git a/src/kernels.cu b/src/kernels.cu
+--- a/src/kernels.cu
++++ b/src/kernels.cu
+@@ -1080,1 +1080,1 @@
+-             void* q8) {
++             void* q8, int16_t* q4k_sums) {
+@@ -1089,1 +1089,2 @@
+     if (q8) twin_of(q8, N, a.tq, a.td);
++    a.q4k_sums = q4k_sums;
+@@ -1985,2 +1986,2 @@
+ void moe_mm(bool down, const DW& A, size_t sa, const Job* jobs, const int* njobs, int njobs_max, const void* in, void* out,
+-            void* st, int tt = 0) {
++            void* st, int tt = 0, const int16_t* q4k_sums = nullptr) {
+@@ -1993,1 +1994,1 @@
+-            else gu_q4k_launch(T, w, jobs, njobs, njobs_max, (const block_q8_1*) in, (float*) out, s);
++            else gu_q4k_launch(T, w, jobs, njobs, njobs_max, (const block_q8_1*) in, (float*) out, s, {}, q4k_sums);
+@@ -2022,4 +2023,4 @@
+ void moe_gate_up(const DW& A, size_t sa, const Job* jobs, const int* njobs, int njobs_max, const void* xq, float* gu, void* st,
+-                 const Q8S* sh_down, int sh_ffs, const float* sh_gu, float* sh_out) {
++                 const Q8S* sh_down, int sh_ffs, const float* sh_gu, float* sh_out, const int16_t* q4k_sums) {
+     if (!sh_down) {
+-        moe_mm(false, A, sa, jobs, njobs, njobs_max, xq, gu, st);
++        moe_mm(false, A, sa, jobs, njobs, njobs_max, xq, gu, st, 0, q4k_sums);
+@@ -2034,1 +2035,1 @@
+-    gu_q4k_launch(njobs_max / TOPK, w, jobs, njobs, njobs_max, (const block_q8_1*) xq, gu, (cudaStream_t) st, sd);
++    gu_q4k_launch(njobs_max / TOPK, w, jobs, njobs, njobs_max, (const block_q8_1*) xq, gu, (cudaStream_t) st, sd, q4k_sums);
+diff --git a/src/moe_q4k.cuh b/src/moe_q4k.cuh
+--- a/src/moe_q4k.cuh
++++ b/src/moe_q4k.cuh
+@@ -39,1 +39,1 @@
+-template <int I0, int I1, bool CACHE_SUMS, bool TWIN>
++template <int I0, int I1, bool CACHE_SUMS, bool TWIN, bool PRODUCER_SUMS>
+@@ -95,2 +95,2 @@
+             if constexpr (CACHE_SUMS) {
+-                const int off = j * (N / 32) + b * 8 + jg * 2;
++                const size_t off = PRODUCER_SUMS ? yoff : j * (N / 32) + b * 8 + jg * 2;
+@@ -109,1 +109,1 @@
+-template <int TT, bool CACHE_SUMS = false, bool TWIN = false>
++template <int TT, bool CACHE_SUMS = false, bool TWIN = false, bool PRODUCER_SUMS = false>
+@@ -114,3 +114,3 @@
+-    q4k_groups<0, SPLIT, CACHE_SUMS, TWIN>(wrow, lane8, n, y, ys, y_stride, tmp, sums, tq, td);
++    q4k_groups<0, SPLIT, CACHE_SUMS, TWIN, PRODUCER_SUMS>(wrow, lane8, n, y, ys, y_stride, tmp, sums, tq, td);
+     asm volatile("" ::: "memory");
+-    q4k_groups<SPLIT, Q4K_GPL, CACHE_SUMS, TWIN>(wrow, lane8, n, y, ys, y_stride, tmp, sums, tq, td);
++    q4k_groups<SPLIT, Q4K_GPL, CACHE_SUMS, TWIN, PRODUCER_SUMS>(wrow, lane8, n, y, ys, y_stride, tmp, sums, tq, td);
+@@ -121,4 +121,5 @@
+-template <int TT, bool TWIN = false>
++template <int TT, bool TWIN = false, bool PRODUCER_SUMS = false>
+ __global__ void __launch_bounds__(Q4K_THREADS) k_moe_gu_q4k(MoeW w, const Job* __restrict__ jobs, const int* __restrict__ njobs,
+                                                           const block_q8_1* __restrict__ y, float* __restrict__ out, const ShexpDown sd,
+-                                                          int sd_rows, const int8_t* __restrict__ tq, const float* __restrict__ td) {
++                                                          int sd_rows, const int8_t* __restrict__ tq, const float* __restrict__ td,
++                                                          const int16_t* __restrict__ producer_sums) {
+@@ -139,14 +140,20 @@
+     __shared__ int16_t sums[TT * YB];
+-    for (int k = threadIdx.x; k < jb.n * YB; k += blockDim.x) {
+-        const auto& act = y[(size_t) jb.y[k / YB] * YB + k % YB];
+-        const int* a = reinterpret_cast<const int*>(act.qs);
+-        int sum = 0;
++    if constexpr (!PRODUCER_SUMS) {
++        for (int k = threadIdx.x; k < jb.n * YB; k += blockDim.x) {
++            const auto& act = y[(size_t) jb.y[k / YB] * YB + k % YB];
++            const int* a = reinterpret_cast<const int*>(act.qs);
++            int sum = 0;
+ #pragma unroll
+-        for (int u = 0; u < 8; ++u) sum = __dp4a(0x01010101, a[u], sum);
+-        sums[k] = static_cast<int16_t>(sum);
++            for (int u = 0; u < 8; ++u) sum = __dp4a(0x01010101, a[u], sum);
++            sums[k] = static_cast<int16_t>(sum);
++        }
++        __syncthreads();
+     }
+-    __syncthreads();
+     const int row = blockIdx.x * Q4K_ROWS + threadIdx.x / Q4K_LPR, lane8 = threadIdx.x % Q4K_LPR;
+     const bool live = row < w.nrows;
+     float tmp[TT] = {};
+-    if (live) q4k_row<TT, true, TWIN>(moe_expert(w, jb.w) + (size_t) row * w.row_a, lane8, jb.n, y, jb.y, YB, tmp, sums, tq, td);
++    if (live)
++        q4k_row<TT, true, TWIN, PRODUCER_SUMS>(moe_expert(w, jb.w) + (size_t) row * w.row_a, lane8, jb.n, y, jb.y, YB, tmp,
++                                             PRODUCER_SUMS ? producer_sums : sums, tq, td);
+     job_store<Q4K_LPR, TT>(tmp, jb.n, live, row, jb.out, out, w.nrows);
+@@ -175,1 +182,1 @@
+-                   cudaStream_t s, const ShexpDown& sd = ShexpDown{}) {
++                   cudaStream_t s, const ShexpDown& sd = ShexpDown{}, const int16_t* producer_sums = nullptr) {
+@@ -187,1 +194,7 @@
+         constexpr int TT = decltype(tag)::value;
++        if constexpr (FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3) {
++            if (producer_sums) {
++                k_moe_gu_q4k<TT, false, true><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows, nullptr, nullptr, producer_sums);
++                return;
++            }
++        }
+@@ -190,1 +203,1 @@
+-                k_moe_gu_q4k<TT, true><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows, tq, td);
++                k_moe_gu_q4k<TT, true><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows, tq, td, nullptr);
+@@ -194,1 +207,1 @@
+-        k_moe_gu_q4k<TT><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows, nullptr, nullptr);
++        k_moe_gu_q4k<TT><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows, nullptr, nullptr, nullptr);
