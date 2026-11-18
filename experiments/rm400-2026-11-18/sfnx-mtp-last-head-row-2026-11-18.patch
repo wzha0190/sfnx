@@ -1,0 +1,49 @@
+diff --git a/src/engine.hpp b/src/engine.hpp
+--- a/src/engine.hpp
++++ b/src/engine.hpp
+@@ -197,1 +197,2 @@
+     bool compact_snapshots_ = false;
++    bool mtp_last_row_only_ = false;
+diff --git a/src/engine.cu b/src/engine.cu
+--- a/src/engine.cu
++++ b/src/engine.cu
+@@ -82,1 +82,2 @@
+     compact_snapshots_ = env_flag("FNX_RM400_COMPACT_SNAPSHOTS");
++    mtp_last_row_only_ = env_flag("FNX_RM400_MTP_LAST_ROW");
+@@ -1332,3 +1333,9 @@
+-        dense(mc.head, b.xq, b.mtp_logits, b, T);
+-        penalize_row(b.mtp_logits + (size_t) (T - 1) * (mc.dv1 - mc.dv0), mc.dv1 - mc.dv0, b.mtp_pen, b.mtp_pen_par, b.st);
+-        argmax(b.mtp_logits, mc.dv1 - mc.dv0, T, mc.dv0, b.mtp_bv, b.mtp_bi, b.am_keys, b.ring.err, b.st);
++        // 2026-11-18: only the last row is consumed; preserve the earlier
++        // layer's K/V writes, but avoid projecting their logits.
++        const int rows = mtp_last_row_only_ ? 1 : T;
++        const void* act = b.xq;
++        if (mtp_last_row_only_) act = (const uint8_t*) b.xq + (size_t) (T - 1) * q8_1_bytes(N);
++        dense(mc.head, act, b.mtp_logits, b, rows);
++        penalize_row(b.mtp_logits + (size_t) (rows - 1) * (mc.dv1 - mc.dv0), mc.dv1 - mc.dv0, b.mtp_pen, b.mtp_pen_par, b.st);
++        argmax(b.mtp_logits, mc.dv1 - mc.dv0, rows, mc.dv0, b.mtp_bv, b.mtp_bi, b.am_keys, b.ring.err, b.st);
+diff --git a/src/engine_common.cu b/src/engine_common.cu
+--- a/src/engine_common.cu
++++ b/src/engine_common.cu
+@@ -1276,1 +1276,2 @@
+-        const int nv = mc.dv1 - mc.dv0, last = MTP_HEAD_EVERY_ROW ? T - 1 : 0;   // the last row's head row
++        const int nv = mc.dv1 - mc.dv0;
++        const int last = MTP_HEAD_EVERY_ROW && !mtp_last_row_only_ ? T - 1 : 0;
+diff --git a/tools/fnx_run.cpp b/tools/fnx_run.cpp
+--- a/tools/fnx_run.cpp
++++ b/tools/fnx_run.cpp
+@@ -491,8 +491,15 @@
+         auto run_one = [&](const std::vector<int>& prompt, const fnx::Sampling& smp) {
+             e.reset();
+             fnx::Session s(e, K, LK, eos);
+             fnx::GenStats st;
+             s.read(prompt, st);
+-            s.generate(n, smp, [](int) {}, nullptr, st);
++            uint64_t fingerprint = 14695981039346656037ull;
++            s.generate(n, smp, [&](int tok) { fingerprint = (fingerprint ^ (uint32_t) tok) * 1099511628211ull; }, nullptr, st);
++            if (fnx::env_flag("FNX_RM400_DECODE_FINGERPRINT"))
++                std::printf("decode fingerprint=%016llx tokens=%d rounds=%d drafts=%ld/%ld\n",
++                            (unsigned long long) fingerprint, st.generated, st.rounds,
++                            st.drafts_accepted, st.drafts_offered);
+             return st;
+         };
