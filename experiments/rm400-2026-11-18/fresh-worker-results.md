@@ -30,3 +30,9 @@ in `/proc`. The model holder stayed up throughout.
   fell by 1.0%/1.3%/1.4%. The 4K forced-continuation logits were byte
   identical. This is a modest prefill gain, not a decode improvement or
   full model acceptance. No feature was enabled in production.
+
+Apply [fresh-worker-stack.patch](fresh-worker-stack.patch) with `git apply`
+on upstream `980873394a532ca0f187aae034ed4819bb205921` and use `make lab`
+with `ARCH=70 FNX_NCARD=3`. The aggregate patch replaces applying the
+individual patches; do not apply both. The held-worker runs predate the
+short gate/up experiment.

@@ -26,3 +26,12 @@ one matched pass, not proof of a sustained regression or of zero
 regression. This was an isolated matched diagnostic; it does not
 replace the current accepted production row or establish a routed gain.
 
+To reproduce the exact source, apply [matched-api-stack.patch](matched-api-stack.patch)
+with `git apply` at the upstream revision above, then `make bin/sfnx`
+with `ARCH=70 FNX_NCARD=3`. Build the upstream control independently.
+Use `FNX_RM400_COMPACT_SNAPSHOTS=1` for the patched binary with all
+other experiment flags absent, and apply the same production options and
+workload to both. [Probe](measure-rm400-sfnx-onepass.py),
+[upstream JSON](matched-api-upstream-results.json),
+[candidate JSON](matched-api-candidate-results.json) and
+[gate calculator](compare-rm400-sfnx-onepass.py).

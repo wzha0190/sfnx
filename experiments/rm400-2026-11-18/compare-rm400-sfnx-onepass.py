@@ -3,12 +3,19 @@
 
 import argparse
 import json
+from math import isfinite
 from pathlib import Path
 from statistics import mean
 
 
 CASES = ("512", "4K", "16K")
 METRICS = {"decode_tok_s": 1, "prefill_tok_s": 1, "ttft_s": -1}
+
+
+def positive_metrics(case, before, after, key):
+    for value in (before[key], after[key]):
+        if not isfinite(value) or value <= 0:
+            raise ValueError(f"{case}: invalid {key}")
 
 
 def compare(control, candidate, target, metric, threshold=3):
@@ -34,8 +41,7 @@ def compare(control, candidate, target, metric, threshold=3):
             if phase == "measured":
                 deltas[case] = {}
                 for key, direction in METRICS.items():
-                    if min(base[key], trial[key]) <= 0:
-                        raise ValueError(f"{case}: nonpositive {key}")
+                    positive_metrics(case, base, trial, key)
                     deltas[case][key] = 100 * direction * (trial[key] - base[key]) / base[key]
     regressions = [f"{case}/{key}" for case in CASES for key in METRICS if deltas[case][key] < 0]
     gain = deltas[target][metric]
@@ -67,8 +73,7 @@ def bracket(first, second):
                     raise ValueError(f"bracket {phase}/{before['case']}: unmatched {key}")
             metrics = {}
             for key in METRICS:
-                if min(before[key], after[key]) <= 0:
-                    raise ValueError(f"bracket {phase}/{before['case']}: nonpositive {key}")
+                positive_metrics(f"bracket {phase}/{before['case']}", before, after, key)
                 metrics[key] = mean((before[key], after[key]))
             result[phase].append(dict(before, **metrics))
     return result

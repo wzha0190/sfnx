@@ -55,3 +55,7 @@ paths did not run the identical plan. The greedy lane gate and the
 teacher-forced solo logit gate passed, not complete production acceptance.
 No workload in this measured sweep reached 3%.
 
+The ring-size result above has a [method correction](lab-worker-flags.md):
+its function-static flag could have stayed fixed across all nominal
+variants. The segmented compact comparison is not affected because its
+flag is read at engine construction.
