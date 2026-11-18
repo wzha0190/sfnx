@@ -1,0 +1,53 @@
+diff --git a/src/moe_q4k.cuh b/src/moe_q4k.cuh
+--- a/src/moe_q4k.cuh
++++ b/src/moe_q4k.cuh
+@@ -106,13 +106,24 @@
+-template <int TT, bool CACHE_SUMS = false, bool TWIN = false, bool PRODUCER_SUMS = false>
++template <int TT, bool CACHE_SUMS = false, bool TWIN = false, bool PRODUCER_SUMS = false, bool SHORT_GROUPS = false>
+ __device__ __forceinline__ void q4k_row(const char* wrow, int lane8, int n, const block_q8_1* y, const int* ys, int y_stride,
+                                         float* tmp, const int16_t* sums = nullptr, const int8_t* tq = nullptr,
+                                         const float* td = nullptr) {
+-    constexpr int SPLIT = (Q4K_GPL + 1) / 2;
+-    q4k_groups<0, SPLIT, CACHE_SUMS, TWIN, PRODUCER_SUMS>(wrow, lane8, n, y, ys, y_stride, tmp, sums, tq, td);
+-    asm volatile("" ::: "memory");
+-    q4k_groups<SPLIT, Q4K_GPL, CACHE_SUMS, TWIN, PRODUCER_SUMS>(wrow, lane8, n, y, ys, y_stride, tmp, sums, tq, td);
++    // 2026-11-19: shorten the live ranges of the loaded weights on SM70.
++    // This changes neither the group order nor the floating-point expression.
++    if constexpr (SHORT_GROUPS && Q4K_GPL == 5) {
++        q4k_groups<0, 2, CACHE_SUMS, TWIN, PRODUCER_SUMS>(wrow, lane8, n, y, ys, y_stride, tmp, sums, tq, td);
++        asm volatile("" ::: "memory");
++        q4k_groups<2, 4, CACHE_SUMS, TWIN, PRODUCER_SUMS>(wrow, lane8, n, y, ys, y_stride, tmp, sums, tq, td);
++        asm volatile("" ::: "memory");
++        q4k_groups<4, 5, CACHE_SUMS, TWIN, PRODUCER_SUMS>(wrow, lane8, n, y, ys, y_stride, tmp, sums, tq, td);
++    } else {
++        constexpr int SPLIT = (Q4K_GPL + 1) / 2;
++        q4k_groups<0, SPLIT, CACHE_SUMS, TWIN, PRODUCER_SUMS>(wrow, lane8, n, y, ys, y_stride, tmp, sums, tq, td);
++        asm volatile("" ::: "memory");
++        q4k_groups<SPLIT, Q4K_GPL, CACHE_SUMS, TWIN, PRODUCER_SUMS>(wrow, lane8, n, y, ys, y_stride, tmp, sums, tq, td);
++    }
+ }
+ 
+@@ -121,2 +132,2 @@
+-template <int TT, bool TWIN = false, bool PRODUCER_SUMS = false>
++template <int TT, bool TWIN = false, bool PRODUCER_SUMS = false, bool SHORT_GROUPS = false>
+ __global__ void __launch_bounds__(Q4K_THREADS) k_moe_gu_q4k(MoeW w, const Job* __restrict__ jobs, const int* __restrict__ njobs,
+@@ -155,4 +166,4 @@
+     if (live)
+-        q4k_row<TT, true, TWIN, PRODUCER_SUMS>(moe_expert(w, jb.w) + (size_t) row * w.row_a, lane8, jb.n, y, jb.y, YB, tmp,
++        q4k_row<TT, true, TWIN, PRODUCER_SUMS, SHORT_GROUPS>(moe_expert(w, jb.w) + (size_t) row * w.row_a, lane8, jb.n, y, jb.y, YB, tmp,
+                                              PRODUCER_SUMS ? producer_sums : sums, tq, td);
+     job_store<Q4K_LPR, TT>(tmp, jb.n, live, row, jb.out, out, w.nrows);
+@@ -201,5 +212,13 @@
+                 k_moe_gu_q4k<TT, true><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows, tq, td, nullptr);
+                 return;
+             }
++            if constexpr (TT >= 3) {
++                static const bool short_groups = env_flag("FNX_RM400_Q4K_SHORT_GROUPS");
++                if (short_groups) {
++                    k_moe_gu_q4k<TT, false, false, true><<<grid, Q4K_THREADS, 0, s>>>(
++                        w, jobs, njobs, y, out, sd, sd_rows, nullptr, nullptr, nullptr);
++                    return;
++                }
++            }
+         }
+         k_moe_gu_q4k<TT><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows, nullptr, nullptr, nullptr);
