@@ -21,9 +21,8 @@ of the on/off means was +0.18% on prose. Keep the default.
 
 These are held-model prompt reads. The larger chunk helped at 16K but
 did not match the better control at 4K; the smaller chunk helped at 4K but
-lost at 16K. Neither was selected. Paired sparse scoring measured
-17.368 → 17.258 ms at a 4K starting context in a single comparison; at 32K
-it measured 17.632 / 17.678 ms against 17.681 / 17.636 ms without pairing.
-Fingerprints matched, but the bracket did not establish a reliable
-long-context speedup. The direct API candidate leaves these toggles off.
-
+lost at 16K. Neither was selected. Paired sparse scoring was not selected. Its initial held-worker A/B changed a
+function-static flag without starting a new worker, so neither the timing
+nor the matching fingerprints establish that the on-path ran. The draft
+head and global chunk comparisons read their configuration at engine
+construction and are not affected. See [lab-worker-flags.md](lab-worker-flags.md).

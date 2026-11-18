@@ -25,7 +25,12 @@ Verification timing: set `FNX_BENCH_CTX=4096` (or `32768` where noted),
 `FNX_MAX_CTX` as specified below, `FNX_NGRAM=ram`, `FNX_MTP_EXPERTS=q4_0`,
 `FNX_PF_ROWS=4096`; run `bin/fnx_run "$model" bench ref/long64.bin 6 200`.
 Exclude the first verification window. `tools/lab.sh cmd` can also run the
-same benchmark without reloading the model between flags. These timings
+same benchmark without reloading the model between flags. For flags
+cached in function-local statics, set the flag, stop only the worker with
+`tools/lab.sh stop`, then start it with the next `cmd`. The loader can keep
+the engine library mapped after `dlclose`; changing the flag in the same
+worker does not prove the new variant ran. See [lab-worker-flags.md](lab-worker-flags.md).
+These timings
 are not generated-token throughput or quality acceptance. The promotion
 target is 3% for the complete candidate with no headline regression and
 passing correctness, vision, thermal, direct API and routed checks.
