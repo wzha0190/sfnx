@@ -1,0 +1,34 @@
+diff --git a/src/hc.cuh b/src/hc.cuh
+--- a/src/hc.cuh
++++ b/src/hc.cuh
+@@ -170,12 +170,15 @@
+         const int j = t % H_TPRD, row = grp * H_RPG + t / H_TPRD;
+         const int nrows = a.w_inj ? H_ROWS : LR;
+         const bool live = t / H_TPRD < H_RPG && row < nrows;
+-        const int rr = live ? row : 0;
++        // 2026-11-18 experiment: do not load/dot a dummy row in idle warps.
++        // Both boundaries are warp-aligned: live warps still participate
++        // in the same full-mask shuffles as before.
++        static_assert((H_RPG * H_TPRD) % 32 == 0 && (LR * H_TPRD) % 32 == 0 &&
++                          (H_ROWS * H_TPRD) % 32 == 0, "whole down warps");
+         // the thread's weights to registers, then one pass per row t (rolled: unrolled over T the kernel is tens of KB
+         // of code, fetched cold at every launch)
+-        if (rr < LR) {
+-            const uint2* w2 = reinterpret_cast<const uint2*>(a.w_down.q + (size_t) rr * D + col0);
+-            const uint16_t* wd = a.w_down.d + ((size_t) rr * D + col0) / 32;
++        if (live && row < LR) {
++            const uint2* w2 = reinterpret_cast<const uint2*>(a.w_down.q + (size_t) row * D + col0);
++            const uint16_t* wd = a.w_down.d + ((size_t) row * D + col0) / 32;
+@@ -195,2 +198,2 @@
+-                if (live && j == 0) a.part[((size_t) s * T + k) * H_ROWS + row] = acc;
++                if (j == 0) a.part[((size_t) s * T + k) * H_ROWS + row] = acc;
+             }
+@@ -197,2 +200,2 @@
+-        } else {
+-            const uint4* w4 = reinterpret_cast<const uint4*>(a.w_inj + (size_t) (rr - LR) * D + col0);
++        } else if (live) {
++            const uint4* w4 = reinterpret_cast<const uint4*>(a.w_inj + (size_t) (row - LR) * D + col0);
+@@ -215,2 +218,2 @@
+-                if (live && j == 0) a.part[((size_t) s * T + k) * H_ROWS + row] = acc;
++                if (j == 0) a.part[((size_t) s * T + k) * H_ROWS + row] = acc;
+             }

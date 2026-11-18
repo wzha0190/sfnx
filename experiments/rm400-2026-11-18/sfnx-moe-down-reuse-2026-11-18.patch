@@ -1,0 +1,29 @@
+diff --git a/src/moe.cuh b/src/moe.cuh
+--- a/src/moe.cuh
++++ b/src/moe.cuh
+@@ -475,7 +475,12 @@
+         const int rpb = DN_THREADS / (w.ncols / DN_U), nh = njobs_max * (w.ncols / DN_U);   // njobs_max: the window's pairs
+         const dim3 grid((w.nrows + rpb - 1) / rpb, njobs_max);
+         const size_t smem = sizeof(float) * T * DN_THREADS;
+-        if (T > 8) {
++        // 2026-11-18 experiment: try the existing exact prequantized path
++        // at six rows on the two widest Flash-Next shards. The lighter shard,
++        // draft/other shapes, and dense 27B retain the upstream threshold.
++        const bool wide_shard = !FNX_27B && NCARD == 3 && w.ncols == 224;
++        const int pre_after = wide_shard ? 5 : 8;
++        if (T > pre_after) {
+             if (njobs_max > MAXT * TOPK) throw std::runtime_error("moe_down: more pairs than g_moe_hq holds");
+             k_moe_h<<<(nh + 7) / 8, 256, 0, s>>>((const float*) in, w.ncols, njobs_max);
+             k_moe_down<TA, true><<<grid, DN_THREADS, smem, s>>>(w, jobs, njobs, (const float*) in, out);
+diff --git a/tools/kbench.cu b/tools/kbench.cu
+--- a/tools/kbench.cu
++++ b/tools/kbench.cu
+@@ -99,3 +99,3 @@
+-    for (int T : {1, 2, 3, 4, 5, 8, 16}) {
++    for (int T : {1, 2, 3, 4, 5, 6, 8, 16}) {
+@@ -262,3 +262,3 @@
+-        {   // experts, card 2's slice (ff 192): routing rows that share experts the way decode rows do
+-            const int ffs = 192;
++        {   // experts, the wider 224-channel slice on logical card 0/1
++            const int ffs = 224;
+             std::vector<float> lh((size_t) MAXT * (NEXP + 1));

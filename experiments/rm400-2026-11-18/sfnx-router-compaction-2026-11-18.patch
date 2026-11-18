@@ -1,0 +1,45 @@
+diff --git a/src/moe.cuh b/src/moe.cuh
+--- a/src/moe.cuh
++++ b/src/moe.cuh
+@@ -166,29 +166,33 @@
+     constexpr int P = T * TOPK;
+     __shared__ int firstpair[NEXP], slots[NEXP], jobof[NEXP];
+-    __shared__ unsigned char first[MAXT * TOPK];
++    // 2026-11-18: compact first picks in pair order using one ballot
++    // per warp, rather than rescanning the preceding pairs per first pick.
++    constexpr int NW = (P + 31) / 32;
++    __shared__ unsigned warp_count[NW];
+     for (int x2 = e; x2 < NEXP; x2 += RR_THREADS) {
+         firstpair[x2] = P;
+         slots[x2] = 0;
+     }
+     __syncthreads();
+     if (e < P) atomicMin(&firstpair[ex[e]], e);
+     __syncthreads();
+-    if (e < P) first[e] = firstpair[ex[e]] == e;
++    const bool first = e < P && firstpair[ex[e]] == e;
++    const unsigned mask = __ballot_sync(0xffffffffu, first);
++    if (lane == 0 && warp < NW) warp_count[warp] = __popc(mask);
+     __syncthreads();
+-    if (e < P && first[e]) {
+-        int j = 0;
+-        for (int q = 0; q < e; ++q) j += first[q];
++    if (first) {
++        int j = __popc(mask & ((1u << lane) - 1u));
++        for (int q = 0; q < warp; ++q) j += warp_count[q];
+         jobof[ex[e]] = j;
+         gu[j].w = dn[j].w = ex[e];
+     }
+@@ -191,9 +195,10 @@
+         gu[j].out[s] = dn[j].y[s] = dn[j].out[s] = e;
+     }
+     __syncthreads();
+-    if (e < P && first[e]) gu[jobof[ex[e]]].n = dn[jobof[ex[e]]].n = slots[ex[e]];
++    if (first) gu[jobof[ex[e]]].n = dn[jobof[ex[e]]].n = slots[ex[e]];
+     __shared__ int nj;
+     if (e == P) {
+         int n = 0;
+-        for (int q = 0; q < P; ++q) n += first[q];
++#pragma unroll
++        for (int q = 0; q < NW; ++q) n += warp_count[q];
+         njobs[0] = nj = n;
