@@ -92,9 +92,16 @@ def main():
     if bool(args.upstream_repeat) != bool(args.candidate_repeat):
         parser.error("supply both repeats for an ABBA bracket")
     if args.upstream_repeat:
-        upstream = bracket(upstream, json.loads(args.upstream_repeat.read_text()))
-        candidate = bracket(candidate, json.loads(args.candidate_repeat.read_text()))
-    report = compare(upstream, candidate, args.case, args.metric)
+        upstream_repeat = json.loads(args.upstream_repeat.read_text())
+        candidate_repeat = json.loads(args.candidate_repeat.read_text())
+        report = compare(bracket(upstream, upstream_repeat), bracket(candidate, candidate_repeat),
+                         args.case, args.metric)
+        report["paired_passes"] = [
+            compare(upstream, candidate, args.case, args.metric),
+            compare(upstream_repeat, candidate_repeat, args.case, args.metric),
+        ]
+    else:
+        report = compare(upstream, candidate, args.case, args.metric)
     report["recorded_passes_per_profile"] = 2 if args.upstream_repeat else 1
     print(json.dumps(report, indent=2))
     return 0 if report["performance_gate_pass"] and report["response_hash_gate_pass"] else 1
