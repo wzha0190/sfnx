@@ -31,9 +31,11 @@ cached in function-local statics, set the flag, stop only the worker with
 the engine library mapped after `dlclose`; changing the flag in the same
 worker does not prove the new variant ran. See [lab-worker-flags.md](lab-worker-flags.md).
 These timings
-are not generated-token throughput or quality acceptance. The promotion
-target is 3% for the complete candidate with no headline regression and
-passing correctness, vision, thermal, direct API and routed checks.
+are not generated-token throughput or quality acceptance. The current operator-set promotion target (2026-11-19) is a
+0.5% hot API gain for the complete candidate against the currently deployed
+build, with no headline regressions and passing correctness, batch, vision,
+thermal, direct API and routed checks. The earlier 3% threshold still applies
+when interpreting historical gate reports from before the change.
 
 ### Routed-expert gate/up prototype (2026-11-18)
 

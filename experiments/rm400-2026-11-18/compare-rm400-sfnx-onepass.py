@@ -10,6 +10,7 @@ from statistics import mean
 
 CASES = ("512", "4K", "16K")
 METRICS = {"decode_tok_s": 1, "prefill_tok_s": 1, "ttft_s": -1}
+PROMOTION_GAIN_PERCENT = 0.5  # Operator-set 2026-11-19.
 
 
 def positive_metrics(case, before, after, key):
@@ -18,7 +19,7 @@ def positive_metrics(case, before, after, key):
             raise ValueError(f"{case}: invalid {key}")
 
 
-def compare(control, candidate, target, metric, threshold=3):
+def compare(control, candidate, target, metric, threshold=PROMOTION_GAIN_PERCENT):
     for key in ("model", "max_context", "seed"):
         if control[key] != candidate[key]:
             raise ValueError(f"unmatched test metadata: {key}")

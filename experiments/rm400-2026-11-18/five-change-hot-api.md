@@ -32,3 +32,10 @@ settings unchanged. The control engine was `983bf700c3c3...`; this was
 not a comparison against stock upstream. The [one-pass probe](measure-rm400-sfnx-onepass.py)
 and [comparison tool](compare-rm400-sfnx-onepass.py) reproduce the metric.
 No production deployment was made from this result.
+
+## Operator threshold update
+
+The operator subsequently lowered the minimum target gain to 0.5%. The
+[re-scored report](five-change-gate-16k-0p5.json) passes the gain minimum,
+but still fails the unchanged prefill and TTFT non-regression gate.
+No measurements changed and no deployment was made.
