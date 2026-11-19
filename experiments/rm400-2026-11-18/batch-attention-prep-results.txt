@@ -1,0 +1,32 @@
+batch-a1-4096.log:step, 6 lanes, 1 row each: wall 19.525 ms, gpu 19.455 ms
+batch-a1-4096.log:step fingerprint=6fff13dc1fbcfebc
+batch-a1-49152.log:step, 6 lanes, 1 row each: wall 20.821 ms, gpu 20.741 ms
+batch-a1-49152.log:step fingerprint=076cac69b40c5821
+batch-a2-4096.log:step, 6 lanes, 1 row each: wall 19.526 ms, gpu 19.463 ms
+batch-a2-4096.log:step fingerprint=6fff13dc1fbcfebc
+batch-a2-49152.log:step, 6 lanes, 1 row each: wall 20.807 ms, gpu 20.740 ms
+batch-a2-49152.log:step fingerprint=076cac69b40c5821
+batch-exact.log:1 lanes: 16 windows, 11.02 ms a window (first one captures its graph), 90.8 tokens/s in all; 1 of 1 lanes match alone
+batch-exact.log:2 lanes: 16 windows, 12.73 ms a window (first one captures its graph), 157.1 tokens/s in all; 2 of 2 lanes match alone
+batch-exact.log:3 lanes: 16 windows, 14.13 ms a window (first one captures its graph), 212.4 tokens/s in all; 3 of 3 lanes match alone
+batch-exact.log:6 lanes: 16 windows, 17.59 ms a window (first one captures its graph), 341.2 tokens/s in all; 6 of 6 lanes match alone
+batch-exact.log:batched windows give each lane its tokens alone
+batch-exact.log:1 lanes with lookup drafts and the draft layer's chain: 8 windows, 3.6 rows and 17.31 ms a window, 115.5 tokens/s in all, drafts 8 of 21; 1 of 1 lanes match alone
+batch-exact.log:2 lanes with lookup drafts and the draft layer's chain: 9 windows, 5.2 rows and 20.83 ms a window, 170.7 tokens/s in all, drafts 16 of 31; 2 of 2 lanes match alone
+batch-exact.log:3 lanes with lookup drafts and the draft layer's chain: 11 windows, 6.4 rows and 23.02 ms a window, 189.6 tokens/s in all, drafts 17 of 39; 3 of 3 lanes match alone
+batch-exact.log:6 lanes with lookup drafts and the draft layer's chain: 11 windows, 11.3 rows and 31.31 ms a window, 278.7 tokens/s in all, drafts 34 of 62; 6 of 6 lanes match alone
+batch-exact.log:3 lanes sampled (temperature 0.6, top_p 0.95, presence 1.0): 10 windows, 6.6 rows a window, 198.6 tokens/s in all
+batch-exact.log:batched windows with drafts give each lane its tokens alone
+batch-fused-4096.log:step, 6 lanes, 1 row each: wall 18.731 ms, gpu 18.669 ms
+batch-fused-4096.log:step fingerprint=6fff13dc1fbcfebc
+batch-fused-49152.log:step, 6 lanes, 1 row each: wall 19.963 ms, gpu 19.893 ms
+batch-fused-49152.log:step fingerprint=076cac69b40c5821
+bdecode-a1.log:bdecode fingerprints: 160:106881928b39b04b 160:1e6622e058fd010b 160:a80ae9f8d05bdc63 160:2f00e0c11c5510e3 160:8a3f78bd9625df5c 160:f41fa6cbe33596cd
+bdecode-a1.log:bdecode 6 lanes: every lane in: 311.5 tok/s, 12.14 rows and 33.23 ms a window (74 windows); overall 960 tokens, 288.3 tok/s, 107 windows, 31.12 ms a window (verify 26.67), 1.73 tokens a lane a window, drafts 405 of 601
+bdecode-a1.log:bdecode 6 lanes: every lane in, a window: verify 28.25 ms, drafting 4.56 ms (6.58 draft-layer calls), the rest 0.42 ms; graph captures in 4 of 74 windows, 8.18 ms each
+bdecode-a2.log:bdecode fingerprints: 160:106881928b39b04b 160:1e6622e058fd010b 160:a80ae9f8d05bdc63 160:2f00e0c11c5510e3 160:8a3f78bd9625df5c 160:f41fa6cbe33596cd
+bdecode-a2.log:bdecode 6 lanes: every lane in: 312.2 tok/s, 12.14 rows and 33.15 ms a window (74 windows); overall 960 tokens, 289.2 tok/s, 107 windows, 31.03 ms a window (verify 26.62), 1.73 tokens a lane a window, drafts 405 of 601
+bdecode-a2.log:bdecode 6 lanes: every lane in, a window: verify 28.23 ms, drafting 4.51 ms (6.58 draft-layer calls), the rest 0.41 ms; graph captures in 4 of 74 windows, 8.12 ms each
+bdecode-fused.log:bdecode fingerprints: 160:55b79fc5de3cf66a 160:48d342c4e7af7838 160:582e8dad2b984612 160:8e6705bc7beb1602 160:8f0180b97b482fcb 160:7be4fbe2139f8a4a
+bdecode-fused.log:bdecode 6 lanes: every lane in: 323.4 tok/s, 12.18 rows and 32.49 ms a window (71 windows); overall 960 tokens, 300.7 tok/s, 109 windows, 29.29 ms a window (verify 25.10), 1.76 tokens a lane a window, drafts 414 of 587
+bdecode-fused.log:bdecode 6 lanes: every lane in, a window: verify 27.59 ms, drafting 4.48 ms (6.45 draft-layer calls), the rest 0.41 ms; graph captures in 6 of 71 windows, 6.60 ms each
