@@ -1,0 +1,77 @@
+diff --git a/src/dense.cuh b/src/dense.cuh
+--- a/src/dense.cuh
++++ b/src/dense.cuh
+@@ -24,2 +24,2 @@
+-template <int T, int Q8S_R, bool SPLIT, bool SEG>
++template <int T, int Q8S_R, bool SPLIT, bool SEG, int TOKEN_TILE = 0>
+ __device__ __forceinline__ void q8s_block(const Q8Segs& g, int rows, int cols, const block_q8_1* __restrict__ y,
+@@ -51,2 +51,2 @@
+-    if constexpr ((T > 8 && Q8S_R >= 2) || (Q8S_R >= 4 && T > 4)) {
++    if constexpr (TOKEN_TILE || (T > 8 && Q8S_R >= 2) || (Q8S_R >= 4 && T > 4)) {
+         // the step's weights for the warp's rows held, the activations TC rows at a time against them: all T rows'
+@@ -57,2 +57,4 @@
+-        constexpr int TC = 4;
++        // 2026-11-19: retain fewer activation rows in registers, without
++        // changing each lane's column accumulation or its final warp sum.
++        constexpr int TC = TOKEN_TILE ? TOKEN_TILE : 4;
+ #pragma unroll 1
+@@ -156,6 +158,6 @@
+-template <int T, int Q8S_R, bool SPLIT, bool SEG>
++template <int T, int Q8S_R, bool SPLIT, bool SEG, int TOKEN_TILE = 0>
+ __global__ void __launch_bounds__(Q8S_THREADS) k_q8s(const Q8Segs g, int rows, int cols, const block_q8_1* __restrict__ y,
+                                                     const int8_t* __restrict__ tq, const float* __restrict__ td) {
+-    q8s_block<T, Q8S_R, SPLIT, SEG>(g, rows, cols, y, tq, td, blockIdx.x);
++    q8s_block<T, Q8S_R, SPLIT, SEG, TOKEN_TILE>(g, rows, cols, y, tq, td, blockIdx.x);
+ }
+diff --git a/src/kernels.cu b/src/kernels.cu
+--- a/src/kernels.cu
++++ b/src/kernels.cu
+@@ -265,7 +265,7 @@
+-template <int T, int R, bool SPLIT>
++template <int T, int R, bool SPLIT, int TOKEN_TILE = 0>
+ __global__ void __launch_bounds__(Q8S_THREADS) k_q8s_ab(const Q8Segs g, int rows, int cols, const block_q8_1* __restrict__ y,
+                                                        const int8_t* __restrict__ tq, const float* __restrict__ td, const float* __restrict__ W,
+                                                        const float* __restrict__ x, float* __restrict__ yf, int rf) {
+     if ((int) blockIdx.x < rf) gemv4_block<T>(W, x, yf, rf, blockIdx.x);
+-    else q8s_block<T, R, SPLIT, false>(g, rows, cols, y, tq, td, blockIdx.x - rf);
++    else q8s_block<T, R, SPLIT, false, TOKEN_TILE>(g, rows, cols, y, tq, td, blockIdx.x - rf);
+ }
+@@ -2119,4 +2119,19 @@
+ template <int R, bool SPLIT, bool SEG>
+ void q8s_launch(const Q8Segs& g, int rows, int cols, const block_q8_1* y, const int8_t* tq, const float* td, int T, cudaStream_t s) {
+     const dim3 grid((rows + Q8S_THREADS / 32 * R - 1) / (Q8S_THREADS / 32 * R));
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++    if constexpr (R == 4) {
++        static const bool tile2 = env_flag("FNX_RM400_Q8S_TILE2");
++        if (tile2) {
++#define FNX_TILE2(t) case t: k_q8s<t, R, SPLIT, SEG, 2><<<grid, Q8S_THREADS, 0, s>>>(g, rows, cols, y, tq, td); return
++            switch (T) {
++                FNX_TILE2(6);
++                FNX_TILE2(7);
++                FNX_TILE2(8);
++            }
++#undef FNX_TILE2
++        }
++    }
++#endif
+ #define FNX_Q8S(t) k_q8s<t, R, SPLIT, SEG><<<grid, Q8S_THREADS, 0, s>>>(g, rows, cols, y, tq, td)
+@@ -2207,5 +2222,20 @@
+ template <int R, bool SPLIT>
+ void q8s_ab_launch(const Q8Segs& g, int rows, int cols, const block_q8_1* y, const int8_t* tq, const float* td, const float* W,
+                    const float* x, float* yf, int rf, int T, cudaStream_t s) {
+     const dim3 grid(rf + (rows + Q8S_THREADS / 32 * R - 1) / (Q8S_THREADS / 32 * R));
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++    if constexpr (R == 2) {
++        static const bool tile2 = env_flag("FNX_RM400_Q8S_AB_TILE2");
++        if (tile2) {
++#define FNX_TILE2(t) case t: k_q8s_ab<t, R, SPLIT, 2><<<grid, Q8S_THREADS, 0, s>>>(g, rows, cols, y, tq, td, W, x, yf, rf); return
++            switch (T) {
++                FNX_TILE2(6);
++                FNX_TILE2(7);
++                FNX_TILE2(8);
++            }
++#undef FNX_TILE2
++        }
++    }
++#endif
+ #define FNX_QA(t) k_q8s_ab<t, R, SPLIT><<<grid, Q8S_THREADS, 0, s>>>(g, rows, cols, y, tq, td, W, x, yf, rf)

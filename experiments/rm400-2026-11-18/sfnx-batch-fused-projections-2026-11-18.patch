@@ -1,0 +1,91 @@
+diff --git a/src/engine.hpp b/src/engine.hpp
+--- a/src/engine.hpp
++++ b/src/engine.hpp
+@@ -334,1 +334,3 @@
+     void dense(const DW& W, const void* y, float* out, CardBuf& b, int T);
++    bool gdn_project_fused(int T, int nv, CardBuf& b, const LayerW& L);
++    void attn_project(int T, CardBuf& b, const LayerW& L, bool fuse);
+diff --git a/src/engine.cu b/src/engine.cu
+--- a/src/engine.cu
++++ b/src/engine.cu
+@@ -905,10 +905,19 @@
+-// an attention layer's mixer after its hc read (mixed in b.xq): q/k/v, the window's K/V into kc/vc at ctl[0], the
+-// attention, the output projection into b.bo_a
+-void Engine::attention(int T, CardBuf& b, const CardW& w, const LayerW& L, uint16_t* kc, uint16_t* vc, const int* ctl,
+-                       uint16_t* qsa_ring, uint16_t* qsa_pooled, int call) {
+-    // the indexer first (it reads mixed / its q8 copy, which the projections below leave as they are)
+-    if (!L.idx_wq) dense(L.idx_qk, b.xq, b.qsa_y, b, T);
+-    qsa(L.idx_wq, L.idx_wk, b.mixed, b.qsa_y, L.idx_qn, L.idx_kn, qsa_ring, qsa_pooled, b.pg, b.qsa_q, b.qsa_scores, b.qsa_cells,
+-        b.qsa_ncells, max_ctx_ / 4, ctl, T, m_.eps, rope_of(b.mrope), b.att_ring.card, b.st);
+-    if (L.wq.s.q && L.wk.s.q && L.wv.s.q && L.wq.n_in == L.wk.n_in && L.wq.n_in == L.wv.n_in &&
++// 2026-11-18: batched windows can use the single-window projection
++// kernels too; all of these projections are independent by input row.
++static bool batch_fused_projections() {
++    static const bool fused = env_int("FNX_RM400_BATCH_FUSED", 0) != 0;
++    return fused;
++}
++
++bool Engine::gdn_project_fused(int T, int nv, CardBuf& b, const LayerW& L) {
++    if (!L.qkvz.s.q || 2 * nv > 160 || L.qkvz.n_out < 4096 || L.qkvz.n_out >= 8192) return false;
++    q8s_gemv_f32(L.qkvz.s, L.qkvz.n_out, L.qkvz.n_in, b.xq, b.qkvz, L.ab, b.mixed, b.ab, 2 * nv, T, b.st);
++    return true;
++}
++
++void Engine::attn_project(int T, CardBuf& b, const LayerW& L, bool fuse) {
++    if (fuse && L.wq.s.q && L.wk.s.q && L.wv.s.q && L.wq.n_in == L.wk.n_in && L.wq.n_in == L.wv.n_in &&
+         L.wq.n_out + L.wk.n_out + L.wv.n_out >= 8192) {   // q, k and v in one launch (compiled for 8192 rows and more)
+@@ -921,4 +930,14 @@
+         dense(L.wk, b.xq, b.k, b, T);
+         dense(L.wv, b.xq, b.v, b, T);
+     }
++}
++
++// an attention layer's mixer after its hc read (mixed in b.xq): q/k/v, the window's K/V into kc/vc at ctl[0], the
++// attention, the output projection into b.bo_a
++void Engine::attention(int T, CardBuf& b, const CardW& w, const LayerW& L, uint16_t* kc, uint16_t* vc, const int* ctl,
++                       uint16_t* qsa_ring, uint16_t* qsa_pooled, int call) {
++    // the indexer first (it reads mixed / its q8 copy, which the projections below leave as they are)
++    if (!L.idx_wq) dense(L.idx_qk, b.xq, b.qsa_y, b, T);
++    qsa(L.idx_wq, L.idx_wk, b.mixed, b.qsa_y, L.idx_qn, L.idx_kn, qsa_ring, qsa_pooled, b.pg, b.qsa_q, b.qsa_scores, b.qsa_cells,
++        b.qsa_ncells, max_ctx_ / 4, ctl, T, m_.eps, rope_of(b.mrope), b.att_ring.card, b.st);
++    attn_project(T, b, L, true);
+     attn_prep_append(b.qg, b.k, b.v, L.q_norm, L.k_norm, kc, vc, b.pg, b.att_ring.card, T, ctl, m_.eps, rope_of(b.mrope), b.st);
+@@ -1017,5 +1036,3 @@
+                 // ab beside qkvz in one launch (a fork and a join: ~5 us more; compiled for 4096..8191 rows)
+-                if (L.qkvz.s.q && 2 * nv <= 160 && L.qkvz.n_out >= 4096 && L.qkvz.n_out < 8192) {
+-                    q8s_gemv_f32(L.qkvz.s, L.qkvz.n_out, L.qkvz.n_in, b.xq, b.qkvz, L.ab, b.mixed, b.ab, 2 * nv, T, b.st);
+-                } else {
++                if (!gdn_project_fused(T, nv, b, L)) {
+                     ck(cudaEventRecord(b.fork, b.st), "fork");
+@@ -1087,4 +1104,6 @@
+                 const int nv = w.nv();
+-                gemv_f32(L.ab, b.mixed, b.ab, 2 * nv, N, T, b.st);
+-                dense(L.qkvz, b.xq, b.qkvz, b, T);
++                if (!batch_fused_projections() || !gdn_project_fused(T, nv, b, L)) {
++                    gemv_f32(L.ab, b.mixed, b.ab, 2 * nv, N, T, b.st);
++                    dense(L.qkvz, b.xq, b.qkvz, b, T);
++                }
+                 float** rec = b.lane_gdn[(size_t) T];
+@@ -1096,5 +1115,3 @@
+                 else qsa_proj(L.idx_wq, L.idx_wk, b.mixed, b.qsa_y, T, b.st);
+-                dense(L.wq, b.xq, b.qg, b, T);
+-                dense(L.wk, b.xq, b.k, b, T);
+-                dense(L.wv, b.xq, b.v, b, T);
++                attn_project(T, b, L, batch_fused_projections());
+                 const int mp = max_ctx_ / 4;
+@@ -1168,4 +1185,6 @@
+                 const int nv = w.nv();
+-                gemv_f32(L.ab, b.mixed, b.ab, 2 * nv, N, T, b.st);
+-                dense(L.qkvz, b.xq, b.qkvz, b, T);
++                if (!batch_fused_projections() || !gdn_project_fused(T, nv, b, L)) {
++                    gemv_f32(L.ab, b.mixed, b.ab, 2 * nv, N, T, b.st);
++                    dense(L.qkvz, b.xq, b.qkvz, b, T);
++                }
+                 float** rec = b.lane_gdn[(size_t) T];
+@@ -1181,5 +1200,3 @@
+                 else qsa_proj(L.idx_wq, L.idx_wk, b.mixed, b.qsa_y, T, b.st);
+-                dense(L.wq, b.xq, b.qg, b, T);
+-                dense(L.wk, b.xq, b.k, b, T);
+-                dense(L.wv, b.xq, b.v, b, T);
++                attn_project(T, b, L, batch_fused_projections());
+                 const int mp = max_ctx_ / 4;

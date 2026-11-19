@@ -1,0 +1,40 @@
+diff --git a/src/moe.cuh b/src/moe.cuh
+--- a/src/moe.cuh
++++ b/src/moe.cuh
+@@ -390,2 +390,2 @@
+-template <ggml_type TA, bool PRE, bool UNPACK_Q5 = false>
++template <ggml_type TA, bool PRE, bool UNPACK_Q5 = false, int NB = 0>
+ __global__ void __launch_bounds__(DN_THREADS) k_moe_down(MoeW w, const Job* __restrict__ jobs, const int* __restrict__ njobs,
+@@ -401,2 +401,6 @@
+-    const int ffs = w.ncols, nb = ffs / DN_U, n = jb.n;
++    // 2026-11-19: derive integer divisors and the output reduction length
++    // from the two actual V100 shard sizes. Keep block and row ownership.
++    static_assert(NB == 0 || (UNPACK_Q5 && !PRE && (NB == 6 || NB == 7)));
++    const int ffs = NB ? NB * DN_U : w.ncols;
++    const int nb = NB ? NB : ffs / DN_U, n = jb.n;
+     if constexpr (PRE) {
+@@ -440,3 +444,11 @@
+         float s = 0.f;
+-        for (int k = 0; k < nb; ++k) s += part[j][rr * nb + k];
++        if constexpr (NB) {
++            // Preserve the serial addition order and the initial +0.
++#pragma unroll
++            for (int k = 0; k < NB; ++k) s += part[j][rr * NB + k];
++        } else {
++            for (int k = 0; k < nb; ++k) s += part[j][rr * nb + k];
++        }
+         out[(size_t) jb.out[j] * w.nrows + orow] = s;
+@@ -585,3 +597,14 @@
+                 if (unpack && T >= 4 && w.nrows == N && (w.ncols == 192 || w.ncols == 224)) {
++                    static const bool fixed_shape = env_flag("FNX_RM400_Q5_DOWN_FIXED_SHAPE");
++                    if (fixed_shape) {
++                        if (w.ncols == 192)
++                            k_moe_down<TA, false, true, 6><<<grid, DN_THREADS, smem, s>>>(
++                                w, jobs, njobs, (const float*) in, out);
++                        else
++                            k_moe_down<TA, false, true, 7><<<grid, DN_THREADS, smem, s>>>(
++                                w, jobs, njobs, (const float*) in, out);
++                        return;
++                    }
+                     k_moe_down<TA, false, true><<<grid, DN_THREADS, smem, s>>>(
+                         w, jobs, njobs, (const float*) in, out);

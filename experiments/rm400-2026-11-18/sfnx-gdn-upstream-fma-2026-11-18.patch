@@ -1,0 +1,10 @@
+diff --git a/src/gdn_core.cuh b/src/gdn_core.cuh
+--- a/src/gdn_core.cuh
++++ b/src/gdn_core.cuh
+@@ -20,3 +20,5 @@
+ __device__ __forceinline__ float gdn_update(float prior, float decay, float key, float delta) {
+-    return fmaf(key, delta, __fmul_rn(decay, prior));
++    // sm_70 CUDA 12.9 upstream SASS rounds key * delta first, then
++    // fuses decay * prior with that product.
++    return fmaf(decay, prior, __fmul_rn(key, delta));
+ }

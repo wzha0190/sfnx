@@ -1,0 +1,18 @@
+diff --git a/src/qsa.cuh b/src/qsa.cuh
+--- a/src/qsa.cuh
++++ b/src/qsa.cuh
+@@ -123,6 +123,9 @@
+     const int t = blockIdx.y, p = row_pos(lr, pos0p, t), nv = (p + 1) / QSA_POOL;
+-    if (nv <= QSA_TOP) return;
++    // 2026-11-18: the graph sizes the grid for the configured context.
++    // An entirely invisible tile doesn't need the query or the page table.
++    const int j0 = blockIdx.x * blockDim.x;
++    if (nv <= QSA_TOP || j0 >= nv) return;
+     g = row_pages(g, lr, t);
+     __shared__ float qs[QSA_HEADS * QSA_DIM];
+     for (int k = threadIdx.x; k < QSA_HEADS * QSA_DIM; k += blockDim.x) qs[k] = q[(size_t) t * QSA_HEADS * QSA_DIM + k];
+     __syncthreads();
+@@ -129,2 +132,2 @@
+-    const int j = blockIdx.x * blockDim.x + threadIdx.x;
++    const int j = j0 + threadIdx.x;
+     if (j >= nv) return;

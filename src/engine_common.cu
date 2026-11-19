@@ -935,6 +935,13 @@ bool ring_f32() {
     return v == 1;
 }
 
+bool ring3() {
+    const long long v = env_int("FNX_RING3", 0);
+    if (v != 0 && v != 1) throw std::runtime_error("FNX_RING3: 0 or 1, got " + std::to_string(v));
+    if (v == 1 && ring_f32()) throw std::runtime_error("FNX_RING3=1 sends fp16 words, and FNX_RING_F32=1 makes the sums fp32");
+    return v == 1;
+}
+
 BatchDrafts batch_drafts() {
     static const BatchDrafts mode = [] {
         const char* e = std::getenv("FNX_BATCH_DRAFTS");

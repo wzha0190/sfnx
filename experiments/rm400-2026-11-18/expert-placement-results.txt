@@ -1,0 +1,16 @@
+./heldout-a1-4096.log:step, 6 lanes, 1 row each: wall 19.153 ms, gpu 19.096 ms
+./heldout-a1-4096.log:step fingerprint=3f7ead9396421f57
+./heldout-a1-49152.log:step, 6 lanes, 1 row each: wall 20.421 ms, gpu 20.363 ms
+./heldout-a1-49152.log:step fingerprint=a056892788bdf6db
+./heldout-a2-4096.log:step, 6 lanes, 1 row each: wall 19.181 ms, gpu 19.127 ms
+./heldout-a2-4096.log:step fingerprint=3f7ead9396421f57
+./heldout-a2-49152.log:step, 6 lanes, 1 row each: wall 20.436 ms, gpu 20.365 ms
+./heldout-a2-49152.log:step fingerprint=a056892788bdf6db
+./heldout-blend-4096.log:step, 6 lanes, 1 row each: wall 19.129 ms, gpu 19.065 ms
+./heldout-blend-4096.log:step fingerprint=3f7ead9396421f57
+./heldout-blend-49152.log:step, 6 lanes, 1 row each: wall 20.358 ms, gpu 20.298 ms
+./heldout-blend-49152.log:step fingerprint=a056892788bdf6db
+./train-long2.log:step, 6 lanes, 1 row each: wall 19.258 ms, gpu 19.200 ms
+./train-long2.log:step fingerprint=cb73b9e3f8d10bad
+./train-long64.log:step, 6 lanes, 1 row each: wall 19.538 ms, gpu 19.476 ms
+./train-long64.log:step fingerprint=04993c54a8f66b49

@@ -1,0 +1,37 @@
+{
+  "cycles": 16,
+  "peak": {
+    "0": {
+      "core": 67,
+      "hbm": 67,
+      "samples": 605,
+      "busy": 586
+    },
+    "1": {
+      "core": 69,
+      "hbm": 69,
+      "samples": 605,
+      "busy": 583
+    },
+    "2": {
+      "core": 71,
+      "hbm": 71,
+      "samples": 605,
+      "busy": 584
+    }
+  },
+  "sw_hw_thermal_counter_delta_us": [
+    [
+      0,
+      0
+    ],
+    [
+      0,
+      0
+    ],
+    [
+      0,
+      0
+    ]
+  ]
+}

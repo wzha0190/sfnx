@@ -1,0 +1,15 @@
+diff --git a/src/kernels.cu b/src/kernels.cu
+--- a/src/kernels.cu
++++ b/src/kernels.cu
+@@ -510,2 +510,11 @@
+     const int p0 = s * len, p1 = min(ctx, p0 + len);
++    // 2026-11-18: an empty split's consumers read only its marker.
++    // Leave its accumulator untouched and skip the shared-memory setup.
++    if (p0 >= p1) {
++        for (int h = i; h < nh; h += HD) {
++            const size_t slot = ((size_t) t * nq + h0 + h) * ATT_SPLITS + s;
++            mz_out[slot] = AttPart{-INFINITY, 0.f};
++        }
++        return;
++    }
+     __shared__ float q[ATT_MAXH][HD];

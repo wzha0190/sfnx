@@ -1,0 +1,21 @@
+diff --git a/src/hc.cuh b/src/hc.cuh
+--- a/src/hc.cuh
++++ b/src/hc.cuh
+@@ -16,8 +16,15 @@
+-// row groups of 96 rows: lo's quantization blocks (32 rows) never straddle two groups
+-constexpr int H_SL = 512, H_NS = D / H_SL, H_SPS = N / H_SL, H_RPG = 96;
++// 2026-11-18: the three-card Flash-Next V100 grid can use the same 80
++// CTAs with smaller, more even down-row groups. Quantization groups are
++// formed later from the completed row-indexed partials, after grid_sync.
++constexpr int H_SL = 512, H_NS = D / H_SL, H_SPS = N / H_SL;
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++constexpr int H_RPG = 84;
++#else
++constexpr int H_RPG = 96;
++#endif
+ constexpr int H_ROWS = LR + HC, H_RG = (H_ROWS + H_RPG - 1) / H_RPG;
+-static_assert(H_RPG % 32 == 0, "lo blocks inside a group");
+ constexpr int H_TPRD = 8, H_DT = (H_RPG * H_TPRD + 31) / 32 * 32, H_BLOCKS = H_NS * H_RG;
++static_assert(H_RG == 4 && (H_RPG * H_TPRD) % 32 == 0, "four groups of whole down warps");
+ // up: 32 columns per block, H_TPRU lanes per column; lane b < LR / 32 takes lo's 32-value block b
+ constexpr int H_UPC = 32, H_TPRU = 16, H_UB = LR / 32;

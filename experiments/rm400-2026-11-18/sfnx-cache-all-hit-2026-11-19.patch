@@ -1,0 +1,69 @@
+diff --git a/src/moe.cuh b/src/moe.cuh
+--- a/src/moe.cuh
++++ b/src/moe.cuh
+@@ -19,1 +19,2 @@
+-__device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache& ec, int* list) {
++__device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache& ec, int* list,
++                           bool fast_hits) {
+@@ -26,1 +27,21 @@
+     const int s0 = ec.s0[p] + lent, n = ec.n[p] - lent;
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++    // 2026-11-19: keep up to two job slots per lane. With no misses,
++    // omit the transient ref=2 pin but preserve CLOCK normalization.
++    if (fast_hits && nj <= 64) {
++        const int slot0 = lane < nj ? ec.slot_of[base + jobs[lane].w] : -1;
++        const int slot1 = lane + 32 < nj ? ec.slot_of[base + jobs[lane + 32].w] : -1;
++        const bool miss = (lane < nj && slot0 < 0) || (lane + 32 < nj && slot1 < 0);
++        if (!__any_sync(0xffffffffu, miss)) {
++            if (slot0 >= 0) ec.ref[slot0] = 1;
++            if (slot1 >= 0) ec.ref[slot1] = 1;
++            if (lane == 0) {
++                const int hand = ec.hand[p] - s0;
++                ec.hand[p] = s0 + ((hand < 0 || hand >= n) ? 0 : hand);
++                list[0] = 0;
++            }
++            return;
++        }
++    }
++#endif
+@@ -78,2 +99,2 @@
+-                                                            const ExpertCache ec, int layer, int* list, const ShexpUp su) {
++                                                            const ExpertCache ec, int layer, int* list, const ShexpUp su, bool fast_hits) {
+     static_assert(RR_THREADS == Q8S_THREADS, "the shared expert's q8s blocks in the router's launch");
+@@ -224,2 +245,2 @@
+-    if (warp == 0) cache_plan(gu, nj, layer, ec, list);
++    if (warp == 0) cache_plan(gu, nj, layer, ec, list, fast_hits);
+ }
+diff --git a/src/kernels.cu b/src/kernels.cu
+--- a/src/kernels.cu
++++ b/src/kernels.cu
+@@ -1722,3 +1722,4 @@
+-__global__ void __launch_bounds__(32) k_cache_plan(const Job* jobs, const int* njobs, int layer, ExpertCache ec, int* list) {
+-    cache_plan(jobs, njobs[0], layer, ec, list);
++__global__ void __launch_bounds__(32) k_cache_plan(const Job* jobs, const int* njobs, int layer, ExpertCache ec, int* list,
++                                                   bool fast_hits) {
++    cache_plan(jobs, njobs[0], layer, ec, list, fast_hits);
+ }
+@@ -1748,1 +1749,8 @@
+-    if (jobs) k_cache_plan<<<1, 32, 0, (cudaStream_t) st>>>(jobs, njobs, layer, ec, list);
++    if (jobs) {
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++        static const bool fast_hits = env_flag("FNX_RM400_CACHE_ALL_HIT");
++#else
++        constexpr bool fast_hits = false;
++#endif
++        k_cache_plan<<<1, 32, 0, (cudaStream_t) st>>>(jobs, njobs, layer, ec, list, fast_hits);
++    }
+@@ -2002,4 +2010,6 @@
+ #if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++    static const bool fast_hits = env_flag("FNX_RM400_CACHE_ALL_HIT");
+     static const bool fast_winner = env_flag("FNX_RM400_ROUTER_FAST_WINNER");
+ #else
++    constexpr bool fast_hits = false;
+     constexpr bool fast_winner = false;
+@@ -2010,3 +2020,3 @@
+-            k_router_route<TT, true><<<grid, RR_THREADS, 0, s>>>(W, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, ec ? *ec : none, layer, list, su);
++            k_router_route<TT, true><<<grid, RR_THREADS, 0, s>>>(W, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, ec ? *ec : none, layer, list, su, fast_hits);
+         else
+-            k_router_route<TT><<<grid, RR_THREADS, 0, s>>>(W, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, ec ? *ec : none, layer, list, su);
++            k_router_route<TT><<<grid, RR_THREADS, 0, s>>>(W, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, ec ? *ec : none, layer, list, su, fast_hits);

@@ -148,6 +148,7 @@ The ones that change results or are worth knowing. The rest are kernel-level tun
 | Setting | Effect |
 | --- | --- |
 | `FNX_RING_F32=0` or `1` | decode's sums between cards as fp16 pairs (0) or fp32 (1); the prompt path's stay fp16. Default 0 on every count: fp32 costs ~30% of one request's decode on two cards (lab: new code 141 → 98 tok/s, prose 113 → 90). fp32 is the more exact: on three cards it takes the code prompt's KL from 5.75e-4 to 4.38e-4, both within the bar; on two, fp16 pairs leave code and edit slightly over the exactness bar (code KL 7.5e-4 against 6.1e-4, fp32 5.7e-4; edit 7.1e-6 against 5.2e-6, fp32 3.1e-6), with the same top-1 as fp32 on every prompt, so `exact base` there passes only with 1. Four, six and eight are unmeasured; each hop rounds a partial sum to f16 again, so their KL with 0 is the first thing to check |
+| `FNX_RING3=0` or `1` | decode's sums in words of three fp16 values and a 16-bit tag (the 27B's words) instead of two values and a 32-bit tag: a third fewer words, each of the pair ring's chunks cut into its own triples so every element is summed by the same cards in the same order, the same sums bit for bit (`exact` byte for byte against the default's base on long, code, edit and the picture). Default 0: on three V100s behind one EPYC 7443 it measured slower ([docs/single-socket.md](single-socket.md)), the ring's hops being mostly latency there. Refused with `FNX_RING_F32=1` and in the 27B build |
 
 **Context past the trained 262,144**
 

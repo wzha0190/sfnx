@@ -1,0 +1,62 @@
+diff --git a/src/moe.cuh b/src/moe.cuh
+--- a/src/moe.cuh
++++ b/src/moe.cuh
+@@ -71,9 +71,10 @@
+ }
+ 
+-template <int T>
++template <int T, bool FAST_WINNER = false>
+ __global__ void __launch_bounds__(RR_THREADS) k_router_route(const float* __restrict__ W, const float* __restrict__ x,
+                                                             float* __restrict__ logits, int* __restrict__ topi,
+                                                             float* __restrict__ topw, Job* __restrict__ gu, Job* __restrict__ dn,
+                                                             int* __restrict__ njobs, unsigned* __restrict__ counter,
+@@ -150,9 +151,24 @@
+             for (int i = 0; i < NEXP / 32; ++i)
+                 if (!(taken >> i & 1u) && v[i] > bv) { bv = v[i]; bi = lane + 32 * i; }
++            if constexpr (FAST_WINNER) {
++                // 2026-11-19: the usual unique maximum needs one float
++                // reduction and one indexed exchange, not a pair of
++                // shuffles for each reduction stage.
++                const float mx = wmax(bv);
++                const unsigned same = __ballot_sync(0xffffffffu, bv == mx);
++                int winner = __ffs(same) - 1;
++                if (same & (same - 1u)) {
++                    int id = bv == mx ? bi : NEXP;
++#pragma unroll
++                    for (int o = 16; o; o >>= 1) id = min(id, __shfl_xor_sync(0xffffffffu, id, o));
++                    winner = id & 31;
++                }
++                bv = __shfl_sync(0xffffffffu, bv, winner);
++                bi = __shfl_sync(0xffffffffu, bi, winner);
++            } else {
+ #pragma unroll
+-            for (int o = 16; o; o >>= 1) {
+-                const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+-                const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+-                if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
++                for (int o = 16; o; o >>= 1) {
++                    const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
++                    const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
++                    if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
++                }
+             }
+             if ((bi & 31) == lane) taken |= 1u << (bi >> 5);
+diff --git a/src/kernels.cu b/src/kernels.cu
+--- a/src/kernels.cu
++++ b/src/kernels.cu
+@@ -1977,2 +1977,13 @@
+     if (ec && (layer < 0 || layer >= NL || !list)) throw std::runtime_error("router_route: a cache plan needs its layer and list");
+-#define FNX_RR(t) k_router_route<t><<<grid, RR_THREADS, 0, s>>>(W, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, ec ? *ec : none, layer, list, su)
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++    static const bool fast_winner = env_flag("FNX_RM400_ROUTER_FAST_WINNER");
++#else
++    constexpr bool fast_winner = false;
++#endif
++    auto launch = [&](auto tag) {
++        constexpr int TT = decltype(tag)::value;
++        if (fast_winner)
++            k_router_route<TT, true><<<grid, RR_THREADS, 0, s>>>(W, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, ec ? *ec : none, layer, list, su);
++        else
++            k_router_route<TT><<<grid, RR_THREADS, 0, s>>>(W, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, ec ? *ec : none, layer, list, su);
++    };
++#define FNX_RR(t) launch(std::integral_constant<int, t>{})

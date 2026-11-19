@@ -1,0 +1,89 @@
+diff --git a/src/moe.cuh b/src/moe.cuh
+--- a/src/moe.cuh
++++ b/src/moe.cuh
+@@ -317,8 +317,58 @@
+     if (lane == 0) h.ds = make_half2(__float2half(d), __float2half(sm));
+ }
+ 
++// 2026-11-19: unpack a Q5_1 weight block once, not once per token.
++// Keep the two groups of four DP4As and their separately rounded
++// scale/min terms in the same order as llama.cpp's MMVQ implementation.
++struct DownQ5 {
++    half2 dm;
++    int lo[4], hi[4];
++};
++
++__device__ __forceinline__ DownQ5 read_down_q5(const block_q5_1& w) {
++    DownQ5 p;
++    p.dm = w.dm;
++    const unsigned high = (unsigned) get_int_b4(w.qh, 0);
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++        const unsigned low = (unsigned) get_int_b4(w.qs, i), h = high >> (4 * i);
++        p.lo[i] = (low & 0x0f0f0f0fu) | ((h << 4) & 0x00000010u) | ((h << 11) & 0x00001000u) |
++                  ((h << 18) & 0x00100000u) | ((h << 25) & 0x10000000u);
++        p.hi[i] = ((low >> 4) & 0x0f0f0f0fu) | ((h >> 12) & 0x00000010u) | ((h >> 5) & 0x00001000u) |
++                  ((h << 2) & 0x00100000u) | ((h << 9) & 0x10000000u);
++    }
++    return p;
++}
++
++template <int FIRST>
++__device__ __forceinline__ float down_q5_half(const DownQ5& p, const block_q8_1& x, float d, float m) {
++    int dots = 0;
++#pragma unroll
++    for (int i = FIRST; i < FIRST + VDR_Q5_1_Q8_1_MMVQ; ++i) {
++        dots = ggml_cuda_dp4a(p.lo[i], get_int_b4(x.qs, i), dots);
++        dots = ggml_cuda_dp4a(p.hi[i], get_int_b4(x.qs, i + QI5_1), dots);
++    }
++    return dots * d + m / (QI5_1 / VDR_Q5_1_Q8_1_MMVQ);
++}
++
++__device__ __forceinline__ float down_q5_dot(const DownQ5& p, const block_q8_1& x) {
++    static_assert(QI5_1 == 4 && VDR_Q5_1_Q8_1_MMVQ == 2);
++#ifdef FAST_FP16_AVAILABLE
++    const float2 dm = __half22float2(__hmul2(p.dm, x.ds));
++#else
++    const float2 w = __half22float2(p.dm), a = __half22float2(x.ds);
++    const float2 dm = make_float2(w.x * a.x, w.y * a.y);
++#endif
++    float s = 0.f;
++    s += down_q5_half<0>(p, x, dm.x, dm.y);
++    s += down_q5_half<2>(p, x, dm.x, dm.y);
++    return s;
++}
++
+ // PRE: the pairs' h made by k_moe_h (past 8 rows: kbench 16 rows 82.9 -> 70.7 us); else each block makes its own (the
+ // extra launch costs more than it saves: 5 rows 30.7 -> 31.7)
+-template <ggml_type TA, bool PRE>
++template <ggml_type TA, bool PRE, bool UNPACK_Q5 = false>
+ __global__ void __launch_bounds__(DN_THREADS) k_moe_down(MoeW w, const Job* __restrict__ jobs, const int* __restrict__ njobs,
+@@ -356,4 +406,13 @@
+     if (live) {
+         const char* wr = moe_expert(w, jb.w) + (size_t) row * w.row_a;
++        if constexpr (UNPACK_Q5) {
++            static_assert(TA == GGML_TYPE_Q5_1);
++            const DownQ5 p = read_down_q5(reinterpret_cast<const block_q5_1*>(wr)[u]);
++            asm volatile("" ::: "memory"); // keep weight unpack outside the token loop
++#pragma unroll 1
++            for (int j = 0; j < n; ++j) part[j][threadIdx.x] = down_q5_dot(p, hq[j][u]);
++        } else {
+-        for (int j = 0; j < n; ++j) part[j][threadIdx.x] = unit_dot<TA, DN_U>(wr, u, hq[j]);
++            for (int j = 0; j < n; ++j) part[j][threadIdx.x] = unit_dot<TA, DN_U>(wr, u, hq[j]);
++        }
+     }
+@@ -503,4 +562,15 @@
+             k_moe_down<TA, true><<<grid, DN_THREADS, smem, s>>>(w, jobs, njobs, (const float*) in, out);
+         } else {
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++            if constexpr (TA == GGML_TYPE_Q5_1) {
++                static const bool unpack = env_flag("FNX_RM400_Q5_DOWN_UNPACK_ONCE");
++                if (unpack && T >= 4 && w.nrows == N && (w.ncols == 192 || w.ncols == 224)) {
++                    k_moe_down<TA, false, true><<<grid, DN_THREADS, smem, s>>>(
++                        w, jobs, njobs, (const float*) in, out);
++                    return;
++                }
++            }
++#endif
+             k_moe_down<TA, false><<<grid, DN_THREADS, smem, s>>>(w, jobs, njobs, (const float*) in, out);
+         }

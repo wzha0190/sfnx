@@ -1,0 +1,16 @@
+diff --git a/tools/fnx_run.cpp b/tools/fnx_run.cpp
+--- a/tools/fnx_run.cpp
++++ b/tools/fnx_run.cpp
+@@ -1255,2 +1255,5 @@
+         const int L = std::atoi(argv[4]), n = std::atoi(argv[5]), nc = std::atoi(argv[6]);
++        const auto start = fnx::env_int("FNX_RM400_BENCH_TOKEN_OFFSET", 0);
++        if (start < 0 || (size_t) start >= toks.size()) throw std::runtime_error("bench_step: invalid token offset");
++        const auto token_at = [&](int i) { return toks[((size_t) start + i) % toks.size()]; };
+         std::vector<int> lanes{0};
+@@ -1263,4 +1266,4 @@
+-            for (int i = 0; i < nc; ++i) ctx[i] = toks[(i + 97 * r) % toks.size()];
++            for (int i = 0; i < nc; ++i) ctx[i] = token_at(i + 97 * r);
+             e.prefill(ctx);
+-            x[r] = toks[(nc + 97 * r) % toks.size()];
++            x[r] = token_at(nc + 97 * r);
+         }

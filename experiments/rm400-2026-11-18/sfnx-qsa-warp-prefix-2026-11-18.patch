@@ -1,0 +1,71 @@
+diff --git a/src/qsa.cuh b/src/qsa.cuh
+--- a/src/qsa.cuh
++++ b/src/qsa.cuh
+@@ -216,1 +216,21 @@
+ constexpr int QSA_SEL_THREADS = 1024;
++
++// 2026-11-18: each warp scans its own count; a warp-total prefix
++// gives the exact block-wide offset without a block barrier per bit.
++__device__ __forceinline__ int qsa_exclusive_count(int count, int* warp_totals) {
++    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
++    int sum = count;
++#pragma unroll
++    for (int d = 1; d < 32; d <<= 1) {
++        int prev = __shfl_up_sync(0xffffffffu, sum, d);
++        if (lane >= d) sum += prev;
++    }
++    if (lane == 31) warp_totals[warp] = sum;
++    __syncthreads();
++    if (warp == 0) {
++        int total = warp_totals[lane], own = total;
++#pragma unroll
++        for (int d = 1; d < 32; d <<= 1) {
++            int prev = __shfl_up_sync(0xffffffffu, total, d);
++            if (lane >= d) total += prev;
++        }
++        warp_totals[lane] = total - own;
++    }
++    __syncthreads();
++    return sum - count + warp_totals[warp];
++}
++
+@@ -281,22 +301,12 @@
+-    int n_gt = 0, n_eq = 0;
++    int n_eq = 0;
+     for (int j = j0; j < j1; ++j) {
+         const unsigned k = key[j];
+-        n_gt += k > thr;
+         n_eq += k == thr;
+     }
+-    __shared__ int s_gt[QSA_SEL_THREADS], s_eq[QSA_SEL_THREADS];
+-    s_gt[tid] = n_gt;
+-    s_eq[tid] = n_eq;
+-    __syncthreads();
+-    // exclusive scans (Hillis-Steele over the block)
+-    for (int o = 1; o < QSA_SEL_THREADS; o <<= 1) {
+-        const int a = tid >= o ? s_gt[tid - o] : 0, e = tid >= o ? s_eq[tid - o] : 0;
+-        __syncthreads();
+-        s_gt[tid] += a;
+-        s_eq[tid] += e;
+-        __syncthreads();
+-    }
++    static_assert(QSA_SEL_THREADS == 32 * 32, "one warp scans all warp totals");
++    __shared__ int equal_totals[QSA_SEL_THREADS / 32], owned_totals[QSA_SEL_THREADS / 32];
+     // which blocks of the chunk are taken (ties: the first `want` by index), then how many of them this card owns
+-    const int eq_start = s_eq[tid] - n_eq;
++    const int eq_start = qsa_exclusive_count(n_eq, equal_totals);
+     int own = 0;
+@@ -311,12 +321,3 @@
+     }
+-    __syncthreads();
+-    s_gt[tid] = own;
+-    __syncthreads();
+-    for (int o = 1; o < QSA_SEL_THREADS; o <<= 1) {
+-        const int a = tid >= o ? s_gt[tid - o] : 0;
+-        __syncthreads();
+-        s_gt[tid] += a;
+-        __syncthreads();
+-    }
+-    int out = s_gt[tid] - own;   // owned selected blocks before this chunk
++    int out = qsa_exclusive_count(own, owned_totals);
+     int* row = cells + (size_t) t * QSA_MAXSEL;

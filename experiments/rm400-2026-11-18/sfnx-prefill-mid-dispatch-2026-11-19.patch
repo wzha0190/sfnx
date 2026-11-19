@@ -1,0 +1,26 @@
+diff --git a/src/prefill.cu b/src/prefill.cu
+--- a/src/prefill.cu
++++ b/src/prefill.cu
+@@ -894,10 +894,19 @@
+-    const size_t nt = tokens.size(), per = (size_t) K * pf_c_;
++    const size_t nt = tokens.size();
++    size_t chunk_rows = pf_c_;   // capacity, unless the lab selects a smaller scheduling unit
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++    // 2026-11-19: test the measured 4K knee without making the 16K
++    // workload take smaller chunks or shrinking any scratch buffer.
++    static const bool mid_chunks = env_flag("FNX_RM400_PF_MID_CHUNKS");
++    if (mid_chunks && pos_ == 0 && pf_c_ == 4096 && nt >= 3584 && nt <= 6144) chunk_rows = 2048;
++#endif
++    const size_t per = (size_t) K * chunk_rows;
+     // FNX_NGRAM=disk: the first pass's rows are read before anything runs to hide them (~1.6 s for 16,384 rows on this
+     // box's NVMe), so the passes start at one chunk and double: a pass hides the next one's reads while those take less
+     // than its GPU time (~0.1 ms of reads against ~0.26 ms a row), and a one-chunk pass followed by a whole one did not
+     // (2.0 s for the one chunk's 1.06)
+-    const size_t first = m_.ple_rows->mode() == PleRows::Mode::DISK ? std::min(per, (size_t) pf_c_) : per;
++    const size_t first = m_.ple_rows->mode() == PleRows::Mode::DISK ? std::min(per, chunk_rows) : per;
+     auto chunks_of = [&](size_t i0, int half, size_t span) {
+         std::vector<PfChunk> ch;
+-        for (size_t i = i0; i < std::min(nt, i0 + span); i += pf_c_) {
+-            const size_t e = std::min(nt, i + pf_c_);
++        for (size_t i = i0; i < std::min(nt, i0 + span); i += chunk_rows) {
++            const size_t e = std::min(nt, i + chunk_rows);

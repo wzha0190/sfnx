@@ -1,0 +1,193 @@
+diff --git a/src/engine.hpp b/src/engine.hpp
+--- a/src/engine.hpp
++++ b/src/engine.hpp
+@@ -196,1 +196,2 @@
+     bool bench_first_snapshot_ = false;
++    bool compact_snapshots_ = false;
+diff --git a/src/engine.cu b/src/engine.cu
+--- a/src/engine.cu
++++ b/src/engine.cu
+@@ -81,1 +81,2 @@
+ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
++    compact_snapshots_ = env_flag("FNX_RM400_COMPACT_SNAPSHOTS");
+@@ -1043,2 +1044,2 @@
+                 gdn_core(b.qkvz, b.ab, b.chist[l], L.conv, L.dt_bias, L.ssm_a, L.ssm_norm, b.S[l], b.xq, b.ctl, b.gdn_scratch, b.snap[l],
+-                         b.hsnap[l], w.nk, nv, w.vmap, T, eps, b.st, nullptr, bench_first_snapshot_);
++                         b.hsnap[l], w.nk, nv, w.vmap, T, eps, b.st, nullptr, bench_first_snapshot_, compact_snapshots_);
+diff --git a/src/engine_common.cu b/src/engine_common.cu
+--- a/src/engine_common.cu
++++ b/src/engine_common.cu
+@@ -552,5 +552,8 @@
+                 if (is_attn(l)) continue;
+-                jobs[k++] = {b.S[l], b.snap[l] + (size_t) (n - 1) * w.nv() * HS * HS, sbytes};
++                jobs[k++] = {b.S[l], b.snap[l] + (compact_snapshots_ ? 0 : (size_t) (n - 1) * w.nv() * HS * HS), sbytes};
+                 jobs[k++] = {b.chist[l] + wrote * hfloats, b.hsnap[l] + (size_t) (n - 1) * hfloats, hfloats * 4};
+             }
++            // Each recurrent layer contributed one state job followed by one history job.
++            const int recurrent_jobs = k;
+             k += hist_jobs(jobs + k, b, nullptr, (size_t) (n - 1));
+@@ -564,1 +567,2 @@
+-            copy_many(b.commit_jobs, k, b.st);
++            if (compact_snapshots_ && n > 1) replay_gdn_many(b.commit_jobs, k, recurrent_jobs, n, w.nv(), b.st);
++            else copy_many(b.commit_jobs, k, b.st);
+diff --git a/src/kernels.hpp b/src/kernels.hpp
+--- a/src/kernels.hpp
++++ b/src/kernels.hpp
+@@ -93,1 +93,2 @@
+-              const int* vmap, int T, float eps, void* st, float* y32 = nullptr, bool first_snapshot = false);
++              const int* vmap, int T, float eps, void* st, float* y32 = nullptr, bool first_snapshot = false,
++              bool compact_snapshot = false);
+@@ -104,1 +105,2 @@
+     bool first_snapshot = false;
++    bool compact_snapshot = false;
+@@ -381,1 +383,4 @@
+ void copy_many(const CopyJob* jobs, int n, void* st);
++// As copy_many; even jobs in [0, recurrent_jobs) replay the requested
++// prefix of compact recurrent updates from their row-0 state.
++void replay_gdn_many(const CopyJob* jobs, int n, int recurrent_jobs, int keep, int nv, void* st);
+diff --git a/src/gdn_core.cuh b/src/gdn_core.cuh
+--- a/src/gdn_core.cuh
++++ b/src/gdn_core.cuh
+@@ -15,1 +15,9 @@
+ constexpr int GDN_Q = 4, GDN_QC = HS / GDN_Q, GDN_THREADS = GDN_QC * 4;
++
++// 2026-11-18: each compact update is [decay, key[HS], delta[HS]]
++// for one head and row, following one full checkpoint (row 0).
++constexpr int GDN_UPDATE = 1 + 2 * HS;
++__device__ __forceinline__ float gdn_update(float prior, float decay, float key, float delta) {
++    return fmaf(key, delta, __fmul_rn(decay, prior));
++}
++
+@@ -152,10 +160,26 @@
+         const float delta = (vs[t][cl] - gv * kvd) * bv;
++        const bool compact_row = gl.compact_snapshot && t > 0 && t < T - 1;
++        if (compact_row) {
++            float* u = snap + (size_t) nv * HS * HS + ((size_t) (t - 1) * nv + lv) * GDN_UPDATE;
++            if (qq == 0) {
++                if (tid == 0) u[0] = gv;
++                u[1 + tid] = xs[1][t][tid % 32][tid / 32];
++            }
++            if (part == 0) u[1 + HS + col] = delta;
++        }
+         float at0 = 0.f, at1 = 0.f, at2 = 0.f, at3 = 0.f;
+ #pragma unroll
+         for (int r = 0; r < 32; r += 4) {
+-            s[r] = gv * s[r] + xs[1][t][r][part] * delta;
+-            s[r + 1] = gv * s[r + 1] + xs[1][t][r + 1][part] * delta;
+-            s[r + 2] = gv * s[r + 2] + xs[1][t][r + 2][part] * delta;
+-            s[r + 3] = gv * s[r + 3] + xs[1][t][r + 3][part] * delta;
++            if (gl.compact_snapshot) {
++                s[r] = gdn_update(s[r], gv, xs[1][t][r][part], delta);
++                s[r + 1] = gdn_update(s[r + 1], gv, xs[1][t][r + 1][part], delta);
++                s[r + 2] = gdn_update(s[r + 2], gv, xs[1][t][r + 2][part], delta);
++                s[r + 3] = gdn_update(s[r + 3], gv, xs[1][t][r + 3][part], delta);
++            } else {
++                s[r] = gv * s[r] + xs[1][t][r][part] * delta;
++                s[r + 1] = gv * s[r + 1] + xs[1][t][r + 1][part] * delta;
++                s[r + 2] = gv * s[r + 2] + xs[1][t][r + 2][part] * delta;
++                s[r + 3] = gv * s[r + 3] + xs[1][t][r + 3][part] * delta;
++            }
+             at0 += s[r] * xs[0][t][r][part];
+             at1 += s[r + 1] * xs[0][t][r + 1][part];
+@@ -171,1 +195,1 @@
+-        if (t < T - 1 && (!gl.first_snapshot || t == 0)) {
++        if (t < T - 1 && (!(gl.first_snapshot || gl.compact_snapshot) || t == 0)) {
+diff --git a/src/kernels.cu b/src/kernels.cu
+--- a/src/kernels.cu
++++ b/src/kernels.cu
+@@ -1497,8 +1497,29 @@
+-__global__ void k_copy_many(const CopyJob* jobs) {
++template <bool REPLAY>
++__global__ void k_copy_many(const CopyJob* jobs, int recurrent_jobs, int keep, int nv) {
+     const CopyJob j = jobs[blockIdx.y];
+     float4* d = reinterpret_cast<float4*>(j.dst);
+     const float4* s = reinterpret_cast<const float4*>(j.src);
++    if constexpr (REPLAY) {
++        if (blockIdx.y < recurrent_jobs && !(blockIdx.y & 1)) {
++            const float* updates = reinterpret_cast<const float*>(s) + (size_t) nv * HS * HS;
++            for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < j.bytes / 16; i += (size_t) gridDim.x * blockDim.x) {
++                static_assert(HS % 4 == 0, "aligned state vectors");
++                const int head = (4 * i) / (HS * HS), row = (4 * i / HS) % HS, col = 4 * i % HS;
++                float4 v = s[i];
++                for (int t = 1; t < keep; ++t) {
++                    const float* u = updates + ((size_t) (t - 1) * nv + head) * GDN_UPDATE;
++                    const float decay = u[0], key = u[1 + row];
++                    const float* delta = u + 1 + HS + col;
++                    v.x = gdn_update(v.x, decay, key, delta[0]);
++                    v.y = gdn_update(v.y, decay, key, delta[1]);
++                    v.z = gdn_update(v.z, decay, key, delta[2]);
++                    v.w = gdn_update(v.w, decay, key, delta[3]);
++                }
++                d[i] = v;
++            }
++            return;
++        }
++    }
+     for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < j.bytes / 16; i += (size_t) gridDim.x * blockDim.x) d[i] = s[i];
+ }
+ }  // namespace
+@@ -1507,3 +1528,10 @@
+-    k_copy_many<<<dim3(8, n), 256, 0, (cudaStream_t) st>>>(jobs);
++    k_copy_many<false><<<dim3(8, n), 256, 0, (cudaStream_t) st>>>(jobs, 0, 0, 0);
+     ck_launch("copy_many");
+ }
++
++void replay_gdn_many(const CopyJob* jobs, int n, int recurrent_jobs, int keep, int nv, void* st) {
++    if (n <= 0 || keep <= 1 || recurrent_jobs > n || nv <= 0)
++        throw std::runtime_error("replay_gdn_many: invalid commit shape");
++    k_copy_many<true><<<dim3(8, n), 256, 0, (cudaStream_t) st>>>(jobs, recurrent_jobs, keep, nv);
++    ck_launch("replay_gdn_many");
++}
+@@ -1765,1 +1793,1 @@
+-              float eps, void* st, float* y32, bool first_snapshot) {
++              float eps, void* st, float* y32, bool first_snapshot, bool compact_snapshot) {
+@@ -1772,1 +1800,2 @@
+     gl.first_snapshot = first_snapshot;
++    gl.compact_snapshot = compact_snapshot;
+diff --git a/tools/fnx_run.cpp b/tools/fnx_run.cpp
+--- a/tools/fnx_run.cpp
++++ b/tools/fnx_run.cpp
+@@ -169,7 +169,16 @@
+     // the continuation in windows of T: row r of a window starting at step j gives step j + r + 1
+-    for (int j = 0; j + 1 < ns; j += T) {
++    const int requested_keep = (int) fnx::env_int("FNX_RM400_LOGITS_KEEP", T);
++    if (requested_keep < 1 || requested_keep > T) throw std::runtime_error("logits: keep must be in 1..T");
++    for (int j = 0; j + 1 < ns;) {
+         std::vector<int> w(cont.begin() + j, cont.begin() + std::min(ns - 1, j + T));
+-        e.window(w);
+-        put_rows(e.last_logits((int) w.size()), vocab, 0, (int) w.size());
++        const int keep = std::min(requested_keep, (int) w.size());
++        e.verify(w);
++        put_rows(e.last_logits((int) w.size()), vocab, 0, keep);
++        e.commit(keep);
++        j += keep;
+     }
+@@ -1282,3 +1282,6 @@
+         const int T = std::atoi(argv[4]), n = std::atoi(argv[5]);
+         if (fnx::env_flag("FNX_RM400_FIRST_SNAPSHOT")) e.bench_first_snapshot();
++        const int keep = (int) fnx::env_int("FNX_RM400_BENCH_KEEP", 1);
++        if (keep < 1 || keep > T) throw std::runtime_error("bench: keep must be in 1..T");
++        uint64_t fingerprint = 14695981039346656037ull;
+         // FNX_BENCH_CTX=N: the windows at a context of N tokens (the prompt repeated, read through the prompt path)
+@@ -1291,11 +1294,13 @@
+         std::vector<double> wall, gpu;
++        const auto t0 = std::chrono::steady_clock::now();
+         for (int i = 0; i < n; ++i) {
+             std::vector<int> w;
+-            for (int t = 0; t < T; ++t) w.push_back(toks[(i + t) % toks.size()]);
+-            e.verify(w);
++            for (int t = 0; t < T; ++t) w.push_back(toks[((size_t) i * keep + t) % toks.size()]);
++            for (int token : e.verify(w)) fingerprint = (fingerprint ^ (uint32_t) token) * 1099511628211ull;
+             if (i > 0) {   // the first window of a T captures its graph
+                 wall.push_back(e.last_ms);
+                 gpu.push_back(e.last_gpu_ms);
+             }
+-            e.commit(1);
++            e.commit(keep);
+         }
++        const double elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+@@ -1314,2 +1317,4 @@
+         std::printf("bench %d windows of %d rows: wall median %.3f trimmed %.3f ms, gpu median %.3f trimmed %.3f ms\n", n - 1, T, wm, wt,
+                     gm, gt);
++        std::printf("bench top1 fingerprint=%016llx keep=%d loop %.3f ms/window\n",
++                    (unsigned long long) fingerprint, keep, elapsed / n);

@@ -1,0 +1,58 @@
+diff --git a/src/session.cpp b/src/session.cpp
+--- a/src/session.cpp
++++ b/src/session.cpp
+@@ -1,0 +1,5 @@
++// 2026-11-19: an opt-in exact SIMD search for long speculative lookups.
++#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
++#include <immintrin.h>
++#endif
++
+@@ -375,2 +380,32 @@
+ // and the drafts are kept, a short match (new code) is mostly a coincidence
++#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
++__attribute__((target("avx2")))
++static size_t lookup_latest_avx2(const int* ctx, size_t n) {
++    static_assert(LOOKUP_N == 3);
++    const __m256i a = _mm256_set1_epi32(ctx[n]), b = _mm256_set1_epi32(ctx[n + 1]), c = _mm256_set1_epi32(ctx[n + 2]);
++    size_t end = n;
++    while (end >= 8) {
++        const size_t i = end - 8;
++        const __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ctx + i));
++        const __m256i y = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ctx + i + 1));
++        const __m256i z = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ctx + i + 2));
++        const __m256i same = _mm256_and_si256(_mm256_cmpeq_epi32(x, a),
++                             _mm256_and_si256(_mm256_cmpeq_epi32(y, b), _mm256_cmpeq_epi32(z, c)));
++        const unsigned mask = (unsigned) _mm256_movemask_ps(_mm256_castsi256_ps(same));
++        if (mask) return i + 31 - __builtin_clz(mask);
++        end = i;
++    }
++    while (end) {
++        --end;
++        if (ctx[end] == ctx[n] && ctx[end + 1] == ctx[n + 1] && ctx[end + 2] == ctx[n + 2]) return end;
++    }
++    return n;
++}
++#endif
++
+ std::vector<int> lookup_drafts(const std::vector<int>& ctx, int lk, int d1) {
+@@ -380,5 +415,17 @@
+     const size_t n0 = ctx.size() - LOOKUP_N;
+-    for (size_t s = n0; s-- > 0;)
+-        if (std::equal(ctx.begin() + s, ctx.begin() + s + LOOKUP_N, ctx.begin() + n0)) {
++    size_t s = n0;
++#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
++    static const bool use_avx2 = env_flag("FNX_RM400_LOOKUP_AVX2") && __builtin_cpu_supports("avx2");
++    if (use_avx2 && n0 >= 4096) {
++        s = lookup_latest_avx2(ctx.data(), n0);
++    } else
++#endif
++    {
++        for (size_t i = n0; i-- > 0;)
++            if (std::equal(ctx.begin() + i, ctx.begin() + i + LOOKUP_N, ctx.begin() + n0)) { s = i; break; }
++    }
++    if (s != n0) {
+             if (s + LOOKUP_N < ctx.size() && (d1 < 0 || ctx[s + LOOKUP_N] == d1)) {
+@@ -388,3 +435,2 @@
+             }
+-            break;
+         }

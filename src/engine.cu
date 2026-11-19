@@ -85,6 +85,7 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
                           "FNX_KV_PAGES", "FNX_KV_RESERVE_MIB"})
         if (std::getenv(k)) throw std::runtime_error(std::string(k) + " is the 27B's: Flash-Next has nothing it sets");
     if (!m.ple_rows) throw std::runtime_error("Engine: the model has no n-gram rows (a Load::HOLD model runs no engine)");
+    ring3_ = ring3();
     if (ngram_late()) {   // as the engine is made, so a box that cannot map them refuses at start, not at a first token
         h_.ngram_late = hmapped<float>((size_t) MAXT * N);
         h_.ngram_flag = hmapped<unsigned>(1);
@@ -266,6 +267,7 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         b->ring.in = dalloc<unsigned long long>(ring_in_words(MAXT));
         b->ring.ag = dalloc<unsigned long long>(ring_ag_words(MAXT));
         b->ring.f32 = ring_f32();
+        b->ring.r3 = ring3_;   // three values a word fit the fp32 words' room
         b->ring.err = dalloc<unsigned>(1);
         b->att_ring.card = c;
         b->att_ring.in = dalloc<unsigned long long>(att_ring_words());
@@ -445,7 +447,21 @@ void Engine::clear_rings() {
 }
 
 void Engine::tags_room(unsigned n) {
-    if (tag_max_ + n + 1u >= TAG_END) clear_rings();
+    if (tag_max_ + n + 1u >= TAG_END) {
+        clear_rings();
+        return;
+    }
+    // FNX_RING3's 16-bit tags wrap every 256 tags: every card idle, decode's ring buffers zeroed each time the tags
+    // cross a multiple of 128, so no word left in a slot is 256 tags old (the 27B's rule, s27_engine.cu)
+    if (ring3_ && (tag_max_ + n) / 128u != tag_max_ / 128u) {
+        for (CardBuf* b : cb_) { ck(cudaSetDevice(b->dev), "set"); ck(cudaDeviceSynchronize(), "ring clear sync"); }
+        for (CardBuf* b : cb_) {
+            ck(cudaSetDevice(b->dev), "set");
+            ck(cudaMemset(b->ring.in, 0, ring_in_words(MAXT) * sizeof(unsigned long long)), "ring clear");
+            ck(cudaMemset(b->ring.ag, 0, ring_ag_words(MAXT) * sizeof(unsigned long long)), "ring clear");
+        }
+        for (CardBuf* b : cb_) { ck(cudaSetDevice(b->dev), "set"); ck(cudaDeviceSynchronize(), "ring clear sync"); }
+    }
 }
 
 // an arena's K/V pool grows by at least this many pages a lend (64: ~12k positions f16), so lends stay rare

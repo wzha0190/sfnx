@@ -1,0 +1,470 @@
+{
+  "0": {
+    "kernels": [
+      {
+        "calls_per_window": 96.0,
+        "mean_us_per_window": 4013.95,
+        "name": "void fnx::k_ring<false>"
+      },
+      {
+        "calls_per_window": 97.0,
+        "mean_us_per_window": 3275.27,
+        "name": "void fnx::k_hc<6; false; false; false>"
+      },
+      {
+        "calls_per_window": 47.0,
+        "mean_us_per_window": 3229.45,
+        "name": "void fnx::k_moe_gu_q4k<6; false; false; true; false>"
+      },
+      {
+        "calls_per_window": 43.0,
+        "mean_us_per_window": 2015.47,
+        "name": "void fnx::k_moe_down<(ggml_type)7; false; false>"
+      },
+      {
+        "calls_per_window": 48.0,
+        "mean_us_per_window": 1475.34,
+        "name": "void fnx::k_router_route<6; false>"
+      },
+      {
+        "calls_per_window": 36.0,
+        "mean_us_per_window": 1219.5,
+        "name": "void fnx::k_q8s<6; 2; true; false>"
+      },
+      {
+        "calls_per_window": 14.0,
+        "mean_us_per_window": 1109.24,
+        "name": "void fnx::k_q8s<6; 4; true; false>"
+      },
+      {
+        "calls_per_window": 75.0,
+        "mean_us_per_window": 1107.48,
+        "name": "void fnx::k_q8s<6; 1; true; false>"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 949.35,
+        "name": "fnx::k_attn_part"
+      },
+      {
+        "calls_per_window": 36.0,
+        "mean_us_per_window": 864.03,
+        "name": "void fnx::k_gdn_core<1>"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 322.4,
+        "name": "fnx::k_att_merge"
+      },
+      {
+        "calls_per_window": 5.0,
+        "mean_us_per_window": 302.67,
+        "name": "void fnx::k_moe_down<(ggml_type)8; false; false>"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 253.74,
+        "name": "void fnx::k_idx_proj<6>"
+      },
+      {
+        "calls_per_window": 72.0,
+        "mean_us_per_window": 246.67,
+        "name": "fnx::k_idx_prep"
+      },
+      {
+        "calls_per_window": 72.0,
+        "mean_us_per_window": 232.28,
+        "name": "fnx::k_attn_prep"
+      },
+      {
+        "calls_per_window": 48.0,
+        "mean_us_per_window": 224.44,
+        "name": "fnx::k_cache_copy"
+      },
+      {
+        "calls_per_window": 36.0,
+        "mean_us_per_window": 222.91,
+        "name": "void fnx::k_gemv_f32<6; 4>"
+      },
+      {
+        "calls_per_window": 72.0,
+        "mean_us_per_window": 176.8,
+        "name": "fnx::k_kv_append"
+      },
+      {
+        "calls_per_window": 72.0,
+        "mean_us_per_window": 175.72,
+        "name": "fnx::k_idx_pool"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 172.85,
+        "name": "fnx::k_idx_score"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 165.52,
+        "name": "fnx::k_idx_select"
+      },
+      {
+        "calls_per_window": 1.0,
+        "mean_us_per_window": 77.92,
+        "name": "void fnx::k_moe_gu<(ggml_type)13; 32; 6>"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 56.33,
+        "name": "fnx::k_attn_local"
+      },
+      {
+        "calls_per_window": 6.0,
+        "mean_us_per_window": 49.41,
+        "name": "fnx::k_ple_gate"
+      },
+      {
+        "calls_per_window": 13.0,
+        "mean_us_per_window": 37.53,
+        "name": "fnx::k_quantize"
+      },
+      {
+        "calls_per_window": 6.0,
+        "mean_us_per_window": 22.26,
+        "name": "fnx::k_ple_conv"
+      },
+      {
+        "calls_per_window": 1.0,
+        "mean_us_per_window": 7.02,
+        "name": "fnx::k_argmax"
+      },
+      {
+        "calls_per_window": 1.0,
+        "mean_us_per_window": 3.98,
+        "name": "fnx::k_argmax_fin"
+      },
+      {
+        "calls_per_window": 1.0,
+        "mean_us_per_window": 2.99,
+        "name": "fnx::k_hc_write"
+      },
+      {
+        "calls_per_window": 1.0,
+        "mean_us_per_window": 2.86,
+        "name": "fnx::k_swiglu_stacked"
+      }
+    ],
+    "median_graph_ms": 22.129,
+    "windows": 23
+  },
+  "1": {
+    "kernels": [
+      {
+        "calls_per_window": 97.0,
+        "mean_us_per_window": 3270.21,
+        "name": "void fnx::k_hc<6; false; false; false>"
+      },
+      {
+        "calls_per_window": 47.0,
+        "mean_us_per_window": 3230.15,
+        "name": "void fnx::k_moe_gu_q4k<6; false; false; true; false>"
+      },
+      {
+        "calls_per_window": 96.0,
+        "mean_us_per_window": 2884.39,
+        "name": "void fnx::k_ring<false>"
+      },
+      {
+        "calls_per_window": 43.0,
+        "mean_us_per_window": 2012.89,
+        "name": "void fnx::k_moe_down<(ggml_type)7; false; false>"
+      },
+      {
+        "calls_per_window": 48.0,
+        "mean_us_per_window": 1475.59,
+        "name": "void fnx::k_router_route<6; false>"
+      },
+      {
+        "calls_per_window": 36.0,
+        "mean_us_per_window": 1220.26,
+        "name": "void fnx::k_q8s<6; 2; true; false>"
+      },
+      {
+        "calls_per_window": 75.0,
+        "mean_us_per_window": 1106.86,
+        "name": "void fnx::k_q8s<6; 1; true; false>"
+      },
+      {
+        "calls_per_window": 14.0,
+        "mean_us_per_window": 1059.64,
+        "name": "void fnx::k_q8s<6; 4; true; false>"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 942.39,
+        "name": "fnx::k_attn_part"
+      },
+      {
+        "calls_per_window": 36.0,
+        "mean_us_per_window": 852.83,
+        "name": "void fnx::k_gdn_core<1>"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 371.8,
+        "name": "fnx::k_att_merge"
+      },
+      {
+        "calls_per_window": 5.0,
+        "mean_us_per_window": 301.73,
+        "name": "void fnx::k_moe_down<(ggml_type)8; false; false>"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 254.36,
+        "name": "void fnx::k_idx_proj<6>"
+      },
+      {
+        "calls_per_window": 72.0,
+        "mean_us_per_window": 245.87,
+        "name": "fnx::k_idx_prep"
+      },
+      {
+        "calls_per_window": 72.0,
+        "mean_us_per_window": 231.34,
+        "name": "fnx::k_attn_prep"
+      },
+      {
+        "calls_per_window": 48.0,
+        "mean_us_per_window": 224.7,
+        "name": "fnx::k_cache_copy"
+      },
+      {
+        "calls_per_window": 36.0,
+        "mean_us_per_window": 223.05,
+        "name": "void fnx::k_gemv_f32<6; 4>"
+      },
+      {
+        "calls_per_window": 72.0,
+        "mean_us_per_window": 175.22,
+        "name": "fnx::k_idx_pool"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 174.03,
+        "name": "fnx::k_idx_score"
+      },
+      {
+        "calls_per_window": 72.0,
+        "mean_us_per_window": 172.04,
+        "name": "fnx::k_kv_append"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 165.74,
+        "name": "fnx::k_idx_select"
+      },
+      {
+        "calls_per_window": 1.0,
+        "mean_us_per_window": 77.84,
+        "name": "void fnx::k_moe_gu<(ggml_type)13; 32; 6>"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 56.29,
+        "name": "fnx::k_attn_local"
+      },
+      {
+        "calls_per_window": 6.0,
+        "mean_us_per_window": 49.36,
+        "name": "fnx::k_ple_gate"
+      },
+      {
+        "calls_per_window": 13.0,
+        "mean_us_per_window": 38.09,
+        "name": "fnx::k_quantize"
+      },
+      {
+        "calls_per_window": 6.0,
+        "mean_us_per_window": 22.4,
+        "name": "fnx::k_ple_conv"
+      },
+      {
+        "calls_per_window": 1.0,
+        "mean_us_per_window": 7.07,
+        "name": "fnx::k_argmax"
+      },
+      {
+        "calls_per_window": 1.0,
+        "mean_us_per_window": 3.99,
+        "name": "fnx::k_argmax_fin"
+      },
+      {
+        "calls_per_window": 1.0,
+        "mean_us_per_window": 3.03,
+        "name": "fnx::k_hc_write"
+      },
+      {
+        "calls_per_window": 1.0,
+        "mean_us_per_window": 2.81,
+        "name": "fnx::k_swiglu_stacked"
+      }
+    ],
+    "median_graph_ms": 21.115,
+    "windows": 23
+  },
+  "2": {
+    "kernels": [
+      {
+        "calls_per_window": 97.0,
+        "mean_us_per_window": 3288.88,
+        "name": "void fnx::k_hc<6; false; false; false>"
+      },
+      {
+        "calls_per_window": 47.0,
+        "mean_us_per_window": 2912.78,
+        "name": "void fnx::k_moe_gu_q4k<6; false; false; true; false>"
+      },
+      {
+        "calls_per_window": 96.0,
+        "mean_us_per_window": 2315.13,
+        "name": "void fnx::k_ring<false>"
+      },
+      {
+        "calls_per_window": 43.0,
+        "mean_us_per_window": 1775.55,
+        "name": "void fnx::k_moe_down<(ggml_type)7; false; false>"
+      },
+      {
+        "calls_per_window": 48.0,
+        "mean_us_per_window": 1460.45,
+        "name": "void fnx::k_router_route<6; false>"
+      },
+      {
+        "calls_per_window": 36.0,
+        "mean_us_per_window": 1220.04,
+        "name": "void fnx::k_q8s<6; 2; true; false>"
+      },
+      {
+        "calls_per_window": 75.0,
+        "mean_us_per_window": 1111.35,
+        "name": "void fnx::k_q8s<6; 1; true; false>"
+      },
+      {
+        "calls_per_window": 14.0,
+        "mean_us_per_window": 1093.81,
+        "name": "void fnx::k_q8s<6; 4; true; false>"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 943.54,
+        "name": "fnx::k_attn_part"
+      },
+      {
+        "calls_per_window": 36.0,
+        "mean_us_per_window": 852.78,
+        "name": "void fnx::k_gdn_core<1>"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 347.9,
+        "name": "fnx::k_att_merge"
+      },
+      {
+        "calls_per_window": 5.0,
+        "mean_us_per_window": 263.6,
+        "name": "void fnx::k_moe_down<(ggml_type)8; false; false>"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 249.55,
+        "name": "void fnx::k_idx_proj<6>"
+      },
+      {
+        "calls_per_window": 72.0,
+        "mean_us_per_window": 247.28,
+        "name": "fnx::k_idx_prep"
+      },
+      {
+        "calls_per_window": 72.0,
+        "mean_us_per_window": 231.38,
+        "name": "fnx::k_attn_prep"
+      },
+      {
+        "calls_per_window": 36.0,
+        "mean_us_per_window": 221.8,
+        "name": "void fnx::k_gemv_f32<6; 4>"
+      },
+      {
+        "calls_per_window": 48.0,
+        "mean_us_per_window": 210.39,
+        "name": "fnx::k_cache_copy"
+      },
+      {
+        "calls_per_window": 72.0,
+        "mean_us_per_window": 176.49,
+        "name": "fnx::k_kv_append"
+      },
+      {
+        "calls_per_window": 72.0,
+        "mean_us_per_window": 174.89,
+        "name": "fnx::k_idx_pool"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 168.81,
+        "name": "fnx::k_idx_score"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 165.43,
+        "name": "fnx::k_idx_select"
+      },
+      {
+        "calls_per_window": 1.0,
+        "mean_us_per_window": 68.84,
+        "name": "void fnx::k_moe_gu<(ggml_type)13; 32; 6>"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 56.67,
+        "name": "fnx::k_attn_local"
+      },
+      {
+        "calls_per_window": 6.0,
+        "mean_us_per_window": 48.89,
+        "name": "fnx::k_ple_gate"
+      },
+      {
+        "calls_per_window": 13.0,
+        "mean_us_per_window": 37.51,
+        "name": "fnx::k_quantize"
+      },
+      {
+        "calls_per_window": 6.0,
+        "mean_us_per_window": 22.3,
+        "name": "fnx::k_ple_conv"
+      },
+      {
+        "calls_per_window": 1.0,
+        "mean_us_per_window": 6.99,
+        "name": "fnx::k_argmax"
+      },
+      {
+        "calls_per_window": 1.0,
+        "mean_us_per_window": 3.98,
+        "name": "fnx::k_argmax_fin"
+      },
+      {
+        "calls_per_window": 1.0,
+        "mean_us_per_window": 3.05,
+        "name": "fnx::k_hc_write"
+      },
+      {
+        "calls_per_window": 1.0,
+        "mean_us_per_window": 2.88,
+        "name": "fnx::k_swiglu_stacked"
+      }
+    ],
+    "median_graph_ms": 20.149,
+    "windows": 23
+  }
+}

@@ -1,0 +1,257 @@
+diff --git a/src/kernels.hpp b/src/kernels.hpp
+--- a/src/kernels.hpp
++++ b/src/kernels.hpp
+@@ -188,4 +188,12 @@
+     const int* const* pos = nullptr;
+     const int* const* pt = nullptr;
+ };
++// Decode graph arguments copied at capture, not uploaded every step.
++// Positions and page tables remain indirect, as in LaneRows.
++struct LaneAttPrep {
++    LaneRows rows;
++    const int* rot[MAXT] = {};
++    uint16_t* ring[MAXT] = {};
++    uint8_t first[MAXT] = {};  // first window row of each lane's segment
++};
+ #ifdef __CUDACC__
+@@ -208,3 +215,5 @@
+ void qsa_index(const float* y, const float* qn, const float* kn, uint16_t* ring, uint16_t* pooled, const KvPages& g, float* q, const int* pos0, int T,
+                float eps, Rope base, void* st);
++void qsa_index_lanes(const float* y, const float* qn, const float* kn, uint16_t* pooled, const KvPages& g, float* q,
++                     const LaneAttPrep& prep, int T, float eps, Rope base, void* st);
+ // the scores and the selection of rows whose query is in q
+@@ -254,3 +263,5 @@
+ void attn_prep_append(float* qg, float* k, const float* v, const float* q_norm, const float* k_norm, uint16_t* kc, uint16_t* vc,
+                       const KvPages& g, int card, int T, const int* pos0, float eps, Rope base, void* st);
++void attn_prep_append_lanes(float* qg, float* k, const float* v, const float* qn, const float* kn, uint16_t* kc, uint16_t* vc,
++                            const KvPages& g, const LaneAttPrep& prep, int card, int T, float eps, Rope base, void* st);
+ // cnt[e] += how many of the n picks in topi are expert e (FNX_ROUTE_COUNT's tallies)
+diff --git a/src/qsa.cuh b/src/qsa.cuh
+--- a/src/qsa.cuh
++++ b/src/qsa.cuh
+@@ -100,9 +100,9 @@
+-__global__ void __launch_bounds__(QSA_DIM) k_idx_prep_pool(const float* __restrict__ y, const float* __restrict__ qn,
+-                                                           const float* __restrict__ kn, __half* ring, int ring_rows, float* __restrict__ q,
+-                                                           __half* pooled, KvPages g, const int* pos0p, float eps, Rope base) {
+-    const int t = blockIdx.x, part = blockIdx.y, i = threadIdx.x, pos0 = *pos0p, p = pos0 + t;
++__device__ __forceinline__ void idx_prep_pool_row(const float* y, const float* qn, const float* kn, __half* ring,
++                                                 int ring_rows, float* q, __half* pooled, KvPages g, int t,
++                                                 int pos0, int offset, float eps, const Rope& base) {
++    const int part = blockIdx.y, i = threadIdx.x, p = pos0 + offset;
+     __shared__ float sh[32];
+     __shared__ float buf[QSA_DIM];
+-    const float* yt = y + (size_t) t * QSA_ROWS;
++    const float* yt = y + (size_t) offset * QSA_ROWS;
+     if (part < QSA_HEADS) {
+         q[(size_t) t * QSA_HEADS * QSA_DIM + part * QSA_DIM + i] = idx_norm_rope(yt[part * QSA_DIM + i], qn, p, eps, base, sh, buf);
+@@ -124,3 +124,20 @@
+ }
+ 
++__global__ void __launch_bounds__(QSA_DIM) k_idx_prep_pool(const float* __restrict__ y, const float* __restrict__ qn,
++                                                         const float* __restrict__ kn, __half* ring, int ring_rows, float* __restrict__ q,
++                                                         __half* pooled, KvPages g, const int* pos0p, float eps, Rope base) {
++    const int t = blockIdx.x;
++    idx_prep_pool_row(y, qn, kn, ring, ring_rows, q, pooled, g, t, *pos0p, t, eps, base);
++}
++
++__global__ void __launch_bounds__(QSA_DIM) k_idx_prep_pool_lanes(const float* y, const float* qn, const float* kn, int ring_rows,
++                                                               float* q, __half* pooled, KvPages g, LaneAttPrep prep, float eps, Rope base) {
++    const int t = blockIdx.x;
++    base.tab = prep.rot[t];
++    // Pool current-segment keys from y (rounded to half), not the ring
++    // that the other blocks are concurrently updating.
++    const int first = prep.first[t], offset = t - first;
++    idx_prep_pool_row(y + (size_t) first * QSA_ROWS, qn, kn, reinterpret_cast<__half*>(prep.ring[t]), ring_rows, q, pooled,
++                      row_pages(g, prep.rows, t), t, row_pos(prep.rows, nullptr, t) - offset, offset, eps, base);
++}
++
+ // scores[t][j] for the visible blocks j of rows with more than QSA_TOP of them: a thread per block
+diff --git a/src/kernels.cu b/src/kernels.cu
+--- a/src/kernels.cu
++++ b/src/kernels.cu
+@@ -1188,3 +1188,11 @@
+     ck_launch("qsa_index");
+ }
+ 
++void qsa_index_lanes(const float* y, const float* qn, const float* kn, uint16_t* pooled, const KvPages& g, float* q,
++                     const LaneAttPrep& prep, int T, float eps, Rope base, void* st) {
++    k_idx_prep_pool_lanes<<<dim3(T, QSA_HEADS + 2), QSA_DIM, 0, (cudaStream_t) st>>>(
++        y, qn, kn, qsa_ring, q, reinterpret_cast<__half*>(pooled), g, prep, eps, base);
++    ck_launch("qsa_index_lanes");
++}
++
+@@ -1624,4 +1632,4 @@
+-__global__ void __launch_bounds__(HD) k_attn_prep_append(float* qg, float* k, const float* v, const float* qn, const float* kn, __half* kc,
+-                                                         __half* vc, KvPages g, int card, const int* pos0p, float eps, Rope base) {
+-    const int t = blockIdx.y, h = blockIdx.x, i = threadIdx.x, p = *pos0p + t, j = p / 4;
++__device__ __forceinline__ void attn_prep_append_row(float* qg, float* k, const float* v, const float* qn, const float* kn,
++                                                    __half* kc, __half* vc, KvPages g, int card, int p, float eps, const Rope& base) {
++    const int t = blockIdx.y, h = blockIdx.x, i = threadIdx.x, j = p / 4;
+     __shared__ float sh[32];
+@@ -1653,3 +1661,17 @@
+     cache[kvp_row(g, r) + e] = __float2half_rn(x);
+ }
++
++__global__ void __launch_bounds__(HD) k_attn_prep_append(float* qg, float* k, const float* v, const float* qn, const float* kn, __half* kc,
++                                                        __half* vc, KvPages g, int card, const int* pos0p, float eps, Rope base) {
++    attn_prep_append_row(qg, k, v, qn, kn, kc, vc, g, card, *pos0p + (int) blockIdx.y, eps, base);
++}
++
++__global__ void __launch_bounds__(HD) k_attn_prep_append_lanes(float* qg, float* k, const float* v, const float* qn, const float* kn,
++                                                              __half* kc, __half* vc, KvPages g, LaneAttPrep prep, int card, float eps, Rope base) {
++    const int t = blockIdx.y;
++    base.tab = prep.rot[t];
++    attn_prep_append_row(qg, k, v, qn, kn, kc, vc, row_pages(g, prep.rows, t), card,
++                         row_pos(prep.rows, nullptr, t), eps, base);
++}
+ }  // namespace
+@@ -1835,3 +1857,10 @@
+     ck_launch("attn_prep_append");
+ }
++
++void attn_prep_append_lanes(float* qg, float* k, const float* v, const float* qn, const float* kn, uint16_t* kc, uint16_t* vc,
++                            const KvPages& g, const LaneAttPrep& prep, int card, int T, float eps, Rope base, void* st) {
++    k_attn_prep_append_lanes<<<dim3(NQH + 2 * NKVH, T), HD, 0, (cudaStream_t) st>>>(
++        qg, k, v, qn, kn, reinterpret_cast<__half*>(kc), reinterpret_cast<__half*>(vc), g, prep, card, eps, base);
++    ck_launch("attn_prep_append_lanes");
++}
+ }  // namespace fnx
+diff --git a/src/engine.cu b/src/engine.cu
+--- a/src/engine.cu
++++ b/src/engine.cu
+@@ -917,2 +917,15 @@
+ }
+ 
++// 2026-11-19: fuse attention preparation across lanes without
++// changing each lane's positions, page table or rotary input.
++static int batch_attention_prep() {
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++    static const int mode = [] {
++        const auto n = env_int("FNX_RM400_BATCH_ATTN_PREP", 0);
++        if (n < 0 || n > 3) throw std::runtime_error("FNX_RM400_BATCH_ATTN_PREP: expected 0..3");
++        return (int) n;
++    }();
++    return mode;
++#else
++    return 0;
++#endif
++}
+@@ -1134,16 +1134,35 @@
+                 attn_project(T, b, L, batch_fused_projections());
+                 const int mp = max_ctx_ / 4;
+-                for (int r = 0; r < T; ++r) {
+-                    const LaneDev& LD = b.lanes[(size_t) lanes[r]];
+-                    KvPages pg = b.pg;   // the card's page size and rows, the lane's table
+-                    pg.pt = LD.pt;
+-                    qsa_index(b.qsa_y + (size_t) r * qsa_rows(), L.idx_qn, L.idx_kn, LD.ring[l], b.qsa_pooled[l], pg, b.qsa_q + (size_t) r * 512,
+-                              LD.ctl, 1, eps, rope_of(LD.mrope), b.st);
+-                    attn_prep(b.qg + (size_t) r * NQH * 2 * HD, b.k + (size_t) r * NKVH * HD, L.q_norm, L.k_norm, NQH, NKVH, LD.ctl, 1, eps,
+-                              rope_of(LD.mrope), b.st);
+-                    kv_append(b.k + (size_t) r * NKVH * HD, b.v + (size_t) r * NKVH * HD, b.kc[l], b.vc[l], pg, b.att_ring.card, 1, LD.ctl,
+-                              b.st);
+-                }
+-                // every row's selection and attention partials at once, each on its lane's position and pages
+                 const LaneRows lr{b.lane_rows[(size_t) T], b.lane_rows[(size_t) T] + MAXT};
++                const int batch_prep = batch_attention_prep();
++                if (batch_prep) {
++                    LaneAttPrep prep{lr};
++                    for (int r = 0; r < T; ++r) {
++                        const LaneDev& LD = b.lanes[(size_t) lanes[r]];
++                        prep.rot[r] = LD.mrope;
++                        prep.ring[r] = LD.ring[l];
++                        prep.first[r] = (uint8_t) r;
++                    }
++                    if (batch_prep & 1)
++                        qsa_index_lanes(b.qsa_y, L.idx_qn, L.idx_kn, b.qsa_pooled[l], b.pg, b.qsa_q, prep, T, eps, rope_, b.st);
++                    if (batch_prep & 2)
++                        attn_prep_append_lanes(b.qg, b.k, b.v, L.q_norm, L.k_norm, b.kc[l], b.vc[l], b.pg,
++                                               prep, b.att_ring.card, T, eps, rope_, b.st);
++                }
++                if (batch_prep != 3) for (int r = 0; r < T; ++r) {
++                    const LaneDev& LD = b.lanes[(size_t) lanes[r]];
++                    KvPages pg = b.pg;
++                    pg.pt = LD.pt;
++                    if (!(batch_prep & 1))
++                        qsa_index(b.qsa_y + (size_t) r * qsa_rows(), L.idx_qn, L.idx_kn, LD.ring[l], b.qsa_pooled[l], pg,
++                                  b.qsa_q + (size_t) r * 512, LD.ctl, 1, eps, rope_of(LD.mrope), b.st);
++                    if (!(batch_prep & 2)) {
++                        attn_prep(b.qg + (size_t) r * NQH * 2 * HD, b.k + (size_t) r * NKVH * HD, L.q_norm, L.k_norm, NQH, NKVH,
++                                  LD.ctl, 1, eps, rope_of(LD.mrope), b.st);
++                        kv_append(b.k + (size_t) r * NKVH * HD, b.v + (size_t) r * NKVH * HD, b.kc[l], b.vc[l], pg,
++                                  b.att_ring.card, 1, LD.ctl, b.st);
++                    }
++                }
+                 qsa_select_lanes(b.qsa_q, b.qsa_pooled[l], b.pg, b.qsa_scores, b.qsa_cells, b.qsa_ncells, mp, lr, T, b.att_ring.card, b.st);
+                 attn_part_lanes(b.qg, b.kc[l], b.vc[l], b.pg, lr, T, b.att_part, b.st, b.qsa_cells, b.qsa_ncells, b.att_ring.card);
+@@ -1219,16 +1256,36 @@
+                 const int mp = max_ctx_ / 4;
+-                for (int i = 0; i < nl; ++i) {
++                const LaneRows lr{b.lane_rows[(size_t) T], b.lane_rows[(size_t) T] + MAXT};
++                const int batch_prep = batch_attention_prep();
++                if (batch_prep) {
++                    LaneAttPrep prep{lr};
++                    for (int r = 0; r < T; ++r) {
++                        const int i = sg.row_lane[(size_t) r];
++                        const LaneDev& LD = b.lanes[(size_t) lanes[i]];
++                        prep.rot[r] = LD.mrope;
++                        prep.ring[r] = LD.ring[l];
++                        prep.first[r] = (uint8_t) sg.r0[(size_t) i];
++                    }
++                    if (batch_prep & 1)
++                        qsa_index_lanes(b.qsa_y, L.idx_qn, L.idx_kn, b.qsa_pooled[l], b.pg, b.qsa_q, prep, T, eps, rope_, b.st);
++                    if (batch_prep & 2)
++                        attn_prep_append_lanes(b.qg, b.k, b.v, L.q_norm, L.k_norm, b.kc[l], b.vc[l], b.pg,
++                                               prep, b.att_ring.card, T, eps, rope_, b.st);
++                }
++                if (batch_prep != 3) for (int i = 0; i < nl; ++i) {
+                     const LaneDev& LD = b.lanes[(size_t) lanes[i]];
+                     KvPages pg = b.pg;   // the card's page size and rows, the lane's table
+                     pg.pt = LD.pt;
+                     const size_t r = (size_t) sg.r0[(size_t) i];
+                     const int k = counts[(size_t) i];
+-                    qsa_index(b.qsa_y + r * qsa_rows(), L.idx_qn, L.idx_kn, LD.ring[l], b.qsa_pooled[l], pg, b.qsa_q + r * 512, LD.ctl, k, eps,
+-                              rope_of(LD.mrope), b.st);
+-                    attn_prep(b.qg + r * NQH * 2 * HD, b.k + r * NKVH * HD, L.q_norm, L.k_norm, NQH, NKVH, LD.ctl, k, eps,
+-                              rope_of(LD.mrope), b.st);
+-                    kv_append(b.k + r * NKVH * HD, b.v + r * NKVH * HD, b.kc[l], b.vc[l], pg, b.att_ring.card, k, LD.ctl, b.st);
++                    if (!(batch_prep & 1))
++                        qsa_index(b.qsa_y + r * qsa_rows(), L.idx_qn, L.idx_kn, LD.ring[l], b.qsa_pooled[l], pg, b.qsa_q + r * 512, LD.ctl, k,
++                                  eps, rope_of(LD.mrope), b.st);
++                    if (!(batch_prep & 2)) {
++                        attn_prep(b.qg + r * NQH * 2 * HD, b.k + r * NKVH * HD, L.q_norm, L.k_norm, NQH, NKVH, LD.ctl, k, eps,
++                                  rope_of(LD.mrope), b.st);
++                        kv_append(b.k + r * NKVH * HD, b.v + r * NKVH * HD, b.kc[l], b.vc[l], pg, b.att_ring.card, k, LD.ctl, b.st);
++                    }
+                 }
+-                const LaneRows lr{b.lane_rows[(size_t) T], b.lane_rows[(size_t) T] + MAXT};
+                 qsa_select_lanes(b.qsa_q, b.qsa_pooled[l], b.pg, b.qsa_scores, b.qsa_cells, b.qsa_ncells, mp, lr, T, b.att_ring.card, b.st);
+                 attn_part_lanes(b.qg, b.kc[l], b.vc[l], b.pg, lr, T, b.att_part, b.st, b.qsa_cells, b.qsa_ncells, b.att_ring.card);
+diff --git a/tools/fnx_run.cpp b/tools/fnx_run.cpp
+--- a/tools/fnx_run.cpp
++++ b/tools/fnx_run.cpp
+@@ -680,2 +680,3 @@
+         const int seed0 = (int) fnx::env_int("FNX_BDECODE_SEED", 1000);   // lane r's sampling seed: seed0 + r
++        const bool fingerprint = fnx::env_flag("FNX_RM400_BATCH_FINGERPRINT");
+         for (int run = 0; run < 2; ++run) {
+@@ -692,2 +693,3 @@
+             std::vector<int> got((size_t) nl, 0);
++            std::vector<uint64_t> hash((size_t) nl, 14695981039346656037ull);
+             std::vector<bool> ended((size_t) nl, false);
+@@ -709,3 +711,7 @@
+                 long emitted = 0;
+-                const auto out = dec.window(ls, limit, [&](int i, int) { ++got[(size_t) idx[(size_t) i]], ++emitted; });
++                const auto out = dec.window(ls, limit, [&](int i, int token) {
++                    const size_t lane = (size_t) idx[(size_t) i];
++                    ++got[lane], ++emitted;
++                    if (fingerprint) hash[lane] = (hash[lane] ^ (uint32_t) token) * 1099511628211ull;
++                });
+                 ms += dec.last_ms;
+@@ -724,2 +730,8 @@
+             if (run == 0) continue;
++            if (fingerprint) {
++                std::printf("bdecode fingerprints:");
++                for (size_t i = 0; i < hash.size(); ++i)
++                    std::printf(" %d:%016llx", got[i], (unsigned long long) hash[i]);
++                std::printf("\n");
++            }
+             long tokens = 0, offered = 0, accepted = 0;

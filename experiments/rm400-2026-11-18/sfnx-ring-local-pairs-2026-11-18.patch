@@ -1,0 +1,47 @@
+diff --git a/src/kernels.cu b/src/kernels.cu
+--- a/src/kernels.cu
++++ b/src/kernels.cu
+@@ -797,10 +797,24 @@
+-__device__ __forceinline__ float ring_x(const float* x, const RingMoe& m, int T, int t, int i) {
+-    if (!m.part) return x[(size_t) t * N + i];
+-    float s = 0.f;
+-#pragma unroll
+-    for (int k = 0; k < TOPK; ++k) s = fmaf(m.topw[t * TOPK + k], m.part[((size_t) t * TOPK + k) * N + i], s);
+-    return fmaf(sigm(m.logits[(size_t) t * (NEXP + 1) + NEXP]), m.part[((size_t) T * TOPK + t) * N + i], s);
+-}
+ __device__ __forceinline__ float2 ring_x2(const float* x, const RingMoe& m, int T, int t, int p) {
+-    return make_float2(ring_x(x, m, T, t, 2 * p), ring_x(x, m, T, t, 2 * p + 1));
++    // 2026-11-18: use aligned paired reads, without reassociating either sum.
++    static_assert(N == 2 * NP, "ring rows must be whole pairs");
++    if (!m.part) return reinterpret_cast<const float2*>(x)[(size_t) t * NP + p];
++    const float2* values = reinterpret_cast<const float2*>(m.part);
++    float2 sum = make_float2(0.f, 0.f);
++#pragma unroll
++    for (int k = 0; k < TOPK; ++k) {
++        const float wt = m.topw[t * TOPK + k];
++        const float2 v = values[((size_t) t * TOPK + k) * NP + p];
++        sum.x = fmaf(wt, v.x, sum.x);
++        sum.y = fmaf(wt, v.y, sum.y);
++    }
++    const float wt = sigm(m.logits[(size_t) t * (NEXP + 1) + NEXP]);
++    const float2 v = values[((size_t) T * TOPK + t) * NP + p];
++    return make_float2(fmaf(wt, v.x, sum.x), fmaf(wt, v.y, sum.y));
+ }
++
++__device__ __forceinline__ float2 ring_local_before_wait(const float* x, const RingMoe& m, int T, int t, int p) {
++    float2 v = ring_x2(x, m, T, t, p);
++    asm volatile("" : "+f"(v.x), "+f"(v.y) : : "memory");
++    return v;
++}
+@@ -839,3 +853,4 @@
+             const int t = e / len, i = e % len;
++            const float2 local = ring_local_before_wait(x, m, T, t, lo + i);
+             const float2 a = take(slot(in, s - 1, t, i), tag);
+-            put(slot(nin, s, t, i), add2(a, ring_x2(x, m, T, t, lo + i)), tag);
++            put(slot(nin, s, t, i), add2(a, local), tag);
+@@ -847,3 +862,4 @@
+             const int t = e / len, i = e % len;
++            const float2 local = ring_local_before_wait(x, m, T, t, lo + i);
+             const float2 a = take(slot(in, RSTEPS - 1, t, i), tag);
+-            const float2 v = add2(a, ring_x2(x, m, T, t, lo + i));
++            const float2 v = add2(a, local);

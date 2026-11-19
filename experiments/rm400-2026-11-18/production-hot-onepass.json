@@ -1,0 +1,79 @@
+{
+  "label": "promoted-production",
+  "verified_at": "2026-11-18T16:18:44.450913+00:00",
+  "model": "qwen3.8-flash-next-huihui-v2-ud-q4-k-xl-v2",
+  "max_context": 262144,
+  "seed": 488400,
+  "engine_sha256": "983bf700c3c3bae70ccf186908f7ba4542faca9858fd50134e24b7de1af35ad5",
+  "config_sha256": "977f3e4a22748014a74eefab0666bfaae579a7dcdb0f1ef6d13067a105e35fef",
+  "warmup": [
+    {
+      "case": "512",
+      "prompt_tokens": 511,
+      "output_tokens": 128,
+      "cached_tokens": 0,
+      "ttft_s": 0.366091,
+      "wall_s": 1.070107,
+      "prefill_tok_s": 1457.9,
+      "decode_tok_s": 178.7,
+      "output_sha256": "f4a3e437faaefe32b595c96aa388b6af6584ea830c3f3f052ab44ec5f4c64504"
+    },
+    {
+      "case": "4K",
+      "prompt_tokens": 4088,
+      "output_tokens": 128,
+      "cached_tokens": 0,
+      "ttft_s": 1.373977,
+      "wall_s": 2.156434,
+      "prefill_tok_s": 3008.1,
+      "decode_tok_s": 161.5,
+      "output_sha256": "9372a5103d102dbbadffff642285e957b9cf2fd68d2bec46752886e9463d2ac9"
+    },
+    {
+      "case": "16K",
+      "prompt_tokens": 16304,
+      "output_tokens": 128,
+      "cached_tokens": 0,
+      "ttft_s": 4.148815,
+      "wall_s": 4.944222,
+      "prefill_tok_s": 3952.2,
+      "decode_tok_s": 158.9,
+      "output_sha256": "9372a5103d102dbbadffff642285e957b9cf2fd68d2bec46752886e9463d2ac9"
+    }
+  ],
+  "measured": [
+    {
+      "case": "512",
+      "prompt_tokens": 512,
+      "output_tokens": 128,
+      "cached_tokens": 0,
+      "ttft_s": 0.444287,
+      "wall_s": 1.134758,
+      "prefill_tok_s": 1184.1,
+      "decode_tok_s": 183.0,
+      "output_sha256": "740afb2b3b1576bb314aa32e2468e8083489af452cbfd0035f472357fff8a3fc"
+    },
+    {
+      "case": "4K",
+      "prompt_tokens": 4090,
+      "output_tokens": 128,
+      "cached_tokens": 0,
+      "ttft_s": 1.372859,
+      "wall_s": 2.179282,
+      "prefill_tok_s": 3012.0,
+      "decode_tok_s": 156.8,
+      "output_sha256": "9372a5103d102dbbadffff642285e957b9cf2fd68d2bec46752886e9463d2ac9"
+    },
+    {
+      "case": "16K",
+      "prompt_tokens": 16376,
+      "output_tokens": 128,
+      "cached_tokens": 0,
+      "ttft_s": 4.15745,
+      "wall_s": 4.901888,
+      "prefill_tok_s": 3961.0,
+      "decode_tok_s": 169.7,
+      "output_sha256": "7a78a790c224b8bfffeb44d9f9636f98b2203e51242543e2f805697e949d4d4c"
+    }
+  ]
+}

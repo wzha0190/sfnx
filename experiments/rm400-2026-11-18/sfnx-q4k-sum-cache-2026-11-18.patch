@@ -1,0 +1,67 @@
+diff --git a/src/moe_q4k.cuh b/src/moe_q4k.cuh
+--- a/src/moe_q4k.cuh
++++ b/src/moe_q4k.cuh
+@@ -30,3 +30,3 @@
+-template <int I0, int I1>
++template <int I0, int I1, bool CACHE_SUMS>
+ __device__ __forceinline__ void q4k_groups(const char* wrow, int lane8, int n, const block_q8_1* y, const int* ys, int y_stride,
+-                                           float* tmp) {
++                                           float* tmp, const int16_t* sums) {
+@@ -61,11 +61,18 @@
+             int dl = 0, dh = 0, sl = 0, sh = 0;
+ #pragma unroll
+             for (int w = 0; w < 8; ++w) {
+                 const unsigned q = qw[w];
+                 const int al = a0[w], ah = a1[w];
+                 dl = __dp4a((int) (q & 0x0F0F0F0Fu), al, dl);
+                 dh = __dp4a((int) ((q >> 4) & 0x0F0F0F0Fu), ah, dh);
+-                sl = __dp4a(0x01010101, al, sl);
+-                sh = __dp4a(0x01010101, ah, sh);
++                if constexpr (!CACHE_SUMS) {
++                    sl = __dp4a(0x01010101, al, sl);
++                    sh = __dp4a(0x01010101, ah, sh);
++                }
++            }
++            if constexpr (CACHE_SUMS) {
++                const int off = j * (N / 32) + b * 8 + jg * 2;
++                sl = sums[off];
++                sh = sums[off + 1];
+             }
+             const float d8l = __low2float(yb[0].ds), d8h = __low2float(yb[1].ds);
+@@ -79,8 +86,8 @@
+-template <int TT>
++template <int TT, bool CACHE_SUMS = false>
+ __device__ __forceinline__ void q4k_row(const char* wrow, int lane8, int n, const block_q8_1* y, const int* ys, int y_stride,
+-                                        float* tmp) {
++                                        float* tmp, const int16_t* sums = nullptr) {
+     constexpr int SPLIT = (Q4K_GPL + 1) / 2;
+-    q4k_groups<0, SPLIT>(wrow, lane8, n, y, ys, y_stride, tmp);
++    q4k_groups<0, SPLIT, CACHE_SUMS>(wrow, lane8, n, y, ys, y_stride, tmp, sums);
+     asm volatile("" ::: "memory");
+-    q4k_groups<SPLIT, Q4K_GPL>(wrow, lane8, n, y, ys, y_stride, tmp);
++    q4k_groups<SPLIT, Q4K_GPL, CACHE_SUMS>(wrow, lane8, n, y, ys, y_stride, tmp, sums);
+ }
+@@ -101,8 +108,22 @@
+     __shared__ Job jb;
+     if (threadIdx.x == 0) jb = jobs[ji];
+     __syncthreads();
++    // 2026-11-18 experiment: the min correction uses the same activation
++    // sum for every weight row. Reuse the exact signed integer sum, not the
++    // rounded half stored in q8_1's ds. [-4096, 4064] fits in int16_t.
++    constexpr int YB = N / 32;
++    __shared__ int16_t sums[TT * YB];
++    for (int k = threadIdx.x; k < jb.n * YB; k += blockDim.x) {
++        const auto& act = y[(size_t) jb.y[k / YB] * YB + k % YB];
++        const int* a = reinterpret_cast<const int*>(act.qs);
++        int sum = 0;
++#pragma unroll
++        for (int u = 0; u < 8; ++u) sum = __dp4a(0x01010101, a[u], sum);
++        sums[k] = static_cast<int16_t>(sum);
++    }
++    __syncthreads();
+     const int row = blockIdx.x * Q4K_ROWS + threadIdx.x / Q4K_LPR, lane8 = threadIdx.x % Q4K_LPR;
+     const bool live = row < w.nrows;
+     float tmp[TT] = {};
+-    if (live) q4k_row<TT>(moe_expert(w, jb.w) + (size_t) row * w.row_a, lane8, jb.n, y, jb.y, N / 32, tmp);
++    if (live) q4k_row<TT, true>(moe_expert(w, jb.w) + (size_t) row * w.row_a, lane8, jb.n, y, jb.y, YB, tmp, sums);
+     job_store<Q4K_LPR, TT>(tmp, jb.n, live, row, jb.out, out, w.nrows);

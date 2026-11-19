@@ -1,0 +1,440 @@
+{
+  "0": {
+    "kernels": [
+      {
+        "calls_per_window": 97.0,
+        "mean_us_per_window": 3513.79,
+        "name": "void fnx::k_hc<8; false; false; false>"
+      },
+      {
+        "calls_per_window": 47.0,
+        "mean_us_per_window": 3164.23,
+        "name": "void fnx::k_moe_gu_q4k<8; false; false; true; false>"
+      },
+      {
+        "calls_per_window": 43.0,
+        "mean_us_per_window": 2209.08,
+        "name": "void fnx::k_moe_down<(ggml_type)7; false; false>"
+      },
+      {
+        "calls_per_window": 96.0,
+        "mean_us_per_window": 1747.88,
+        "name": "void fnx::k_ring<false>"
+      },
+      {
+        "calls_per_window": 48.0,
+        "mean_us_per_window": 1630.87,
+        "name": "void fnx::k_router_route<8; false>"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 1437.66,
+        "name": "fnx::k_attn_part"
+      },
+      {
+        "calls_per_window": 36.0,
+        "mean_us_per_window": 1340.46,
+        "name": "void fnx::k_q8s_ab<8; 2; true>"
+      },
+      {
+        "calls_per_window": 36.0,
+        "mean_us_per_window": 1012.96,
+        "name": "void fnx::k_gdn_core<8>"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 919.74,
+        "name": "void fnx::k_q8s<8; 4; true; true>"
+      },
+      {
+        "calls_per_window": 51.0,
+        "mean_us_per_window": 893.39,
+        "name": "void fnx::k_q8s<8; 1; true; false>"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 473.4,
+        "name": "fnx::k_idx_select"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 397.54,
+        "name": "fnx::k_att_merge"
+      },
+      {
+        "calls_per_window": 2.0,
+        "mean_us_per_window": 395.48,
+        "name": "void fnx::k_q8s<8; 4; true; false>"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 393.7,
+        "name": "fnx::k_idx_score"
+      },
+      {
+        "calls_per_window": 5.0,
+        "mean_us_per_window": 338.08,
+        "name": "void fnx::k_moe_down<(ggml_type)8; false; false>"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 273.03,
+        "name": "void fnx::k_idx_proj<8>"
+      },
+      {
+        "calls_per_window": 48.0,
+        "mean_us_per_window": 158.32,
+        "name": "fnx::k_cache_copy"
+      },
+      {
+        "calls_per_window": 1.0,
+        "mean_us_per_window": 85.7,
+        "name": "void fnx::k_moe_gu<(ggml_type)13; 32; 8>"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 67.06,
+        "name": "fnx::k_idx_prep_pool"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 61.99,
+        "name": "fnx::k_attn_prep_append"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 58.17,
+        "name": "fnx::k_attn_local"
+      },
+      {
+        "calls_per_window": 13.0,
+        "mean_us_per_window": 37.21,
+        "name": "fnx::k_quantize"
+      },
+      {
+        "calls_per_window": 1.0,
+        "mean_us_per_window": 10.05,
+        "name": "fnx::k_ple_gate"
+      },
+      {
+        "calls_per_window": 1.0,
+        "mean_us_per_window": 9.69,
+        "name": "fnx::k_ple_conv"
+      },
+      {
+        "calls_per_window": 1.0,
+        "mean_us_per_window": 7.59,
+        "name": "fnx::k_argmax"
+      },
+      {
+        "calls_per_window": 1.0,
+        "mean_us_per_window": 4.48,
+        "name": "fnx::k_argmax_fin"
+      },
+      {
+        "calls_per_window": 1.0,
+        "mean_us_per_window": 3.27,
+        "name": "fnx::k_hc_write"
+      },
+      {
+        "calls_per_window": 1.0,
+        "mean_us_per_window": 2.68,
+        "name": "fnx::k_swiglu_stacked"
+      }
+    ],
+    "median_graph_ms": 20.998,
+    "windows": 23
+  },
+  "1": {
+    "kernels": [
+      {
+        "calls_per_window": 97.0,
+        "mean_us_per_window": 3514.04,
+        "name": "void fnx::k_hc<8; false; false; false>"
+      },
+      {
+        "calls_per_window": 47.0,
+        "mean_us_per_window": 3162.25,
+        "name": "void fnx::k_moe_gu_q4k<8; false; false; true; false>"
+      },
+      {
+        "calls_per_window": 43.0,
+        "mean_us_per_window": 2207.06,
+        "name": "void fnx::k_moe_down<(ggml_type)7; false; false>"
+      },
+      {
+        "calls_per_window": 96.0,
+        "mean_us_per_window": 1706.16,
+        "name": "void fnx::k_ring<false>"
+      },
+      {
+        "calls_per_window": 48.0,
+        "mean_us_per_window": 1631.48,
+        "name": "void fnx::k_router_route<8; false>"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 1432.45,
+        "name": "fnx::k_attn_part"
+      },
+      {
+        "calls_per_window": 36.0,
+        "mean_us_per_window": 1339.34,
+        "name": "void fnx::k_q8s_ab<8; 2; true>"
+      },
+      {
+        "calls_per_window": 36.0,
+        "mean_us_per_window": 1012.76,
+        "name": "void fnx::k_gdn_core<8>"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 900.08,
+        "name": "void fnx::k_q8s<8; 4; true; true>"
+      },
+      {
+        "calls_per_window": 51.0,
+        "mean_us_per_window": 892.75,
+        "name": "void fnx::k_q8s<8; 1; true; false>"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 473.26,
+        "name": "fnx::k_idx_select"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 426.93,
+        "name": "fnx::k_att_merge"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 393.19,
+        "name": "fnx::k_idx_score"
+      },
+      {
+        "calls_per_window": 2.0,
+        "mean_us_per_window": 384.54,
+        "name": "void fnx::k_q8s<8; 4; true; false>"
+      },
+      {
+        "calls_per_window": 5.0,
+        "mean_us_per_window": 337.93,
+        "name": "void fnx::k_moe_down<(ggml_type)8; false; false>"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 273.4,
+        "name": "void fnx::k_idx_proj<8>"
+      },
+      {
+        "calls_per_window": 48.0,
+        "mean_us_per_window": 159.51,
+        "name": "fnx::k_cache_copy"
+      },
+      {
+        "calls_per_window": 1.0,
+        "mean_us_per_window": 85.56,
+        "name": "void fnx::k_moe_gu<(ggml_type)13; 32; 8>"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 67.16,
+        "name": "fnx::k_idx_prep_pool"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 62.6,
+        "name": "fnx::k_attn_prep_append"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 58.16,
+        "name": "fnx::k_attn_local"
+      },
+      {
+        "calls_per_window": 13.0,
+        "mean_us_per_window": 37.17,
+        "name": "fnx::k_quantize"
+      },
+      {
+        "calls_per_window": 1.0,
+        "mean_us_per_window": 9.95,
+        "name": "fnx::k_ple_gate"
+      },
+      {
+        "calls_per_window": 1.0,
+        "mean_us_per_window": 9.77,
+        "name": "fnx::k_ple_conv"
+      },
+      {
+        "calls_per_window": 1.0,
+        "mean_us_per_window": 7.55,
+        "name": "fnx::k_argmax"
+      },
+      {
+        "calls_per_window": 1.0,
+        "mean_us_per_window": 4.5,
+        "name": "fnx::k_argmax_fin"
+      },
+      {
+        "calls_per_window": 1.0,
+        "mean_us_per_window": 3.31,
+        "name": "fnx::k_hc_write"
+      },
+      {
+        "calls_per_window": 1.0,
+        "mean_us_per_window": 2.71,
+        "name": "fnx::k_swiglu_stacked"
+      }
+    ],
+    "median_graph_ms": 20.938,
+    "windows": 23
+  },
+  "2": {
+    "kernels": [
+      {
+        "calls_per_window": 97.0,
+        "mean_us_per_window": 3528.7,
+        "name": "void fnx::k_hc<8; false; false; false>"
+      },
+      {
+        "calls_per_window": 47.0,
+        "mean_us_per_window": 2836.84,
+        "name": "void fnx::k_moe_gu_q4k<8; false; false; true; false>"
+      },
+      {
+        "calls_per_window": 96.0,
+        "mean_us_per_window": 2420.77,
+        "name": "void fnx::k_ring<false>"
+      },
+      {
+        "calls_per_window": 43.0,
+        "mean_us_per_window": 1889.32,
+        "name": "void fnx::k_moe_down<(ggml_type)7; false; false>"
+      },
+      {
+        "calls_per_window": 48.0,
+        "mean_us_per_window": 1621.34,
+        "name": "void fnx::k_router_route<8; false>"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 1430.16,
+        "name": "fnx::k_attn_part"
+      },
+      {
+        "calls_per_window": 36.0,
+        "mean_us_per_window": 1345.6,
+        "name": "void fnx::k_q8s_ab<8; 2; true>"
+      },
+      {
+        "calls_per_window": 36.0,
+        "mean_us_per_window": 1016.4,
+        "name": "void fnx::k_gdn_core<8>"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 919.15,
+        "name": "void fnx::k_q8s<8; 4; true; true>"
+      },
+      {
+        "calls_per_window": 51.0,
+        "mean_us_per_window": 898.86,
+        "name": "void fnx::k_q8s<8; 1; true; false>"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 472.91,
+        "name": "fnx::k_idx_select"
+      },
+      {
+        "calls_per_window": 2.0,
+        "mean_us_per_window": 400.47,
+        "name": "void fnx::k_q8s<8; 4; true; false>"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 392.87,
+        "name": "fnx::k_idx_score"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 386.02,
+        "name": "fnx::k_att_merge"
+      },
+      {
+        "calls_per_window": 5.0,
+        "mean_us_per_window": 291.68,
+        "name": "void fnx::k_moe_down<(ggml_type)8; false; false>"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 272.82,
+        "name": "void fnx::k_idx_proj<8>"
+      },
+      {
+        "calls_per_window": 48.0,
+        "mean_us_per_window": 154.42,
+        "name": "fnx::k_cache_copy"
+      },
+      {
+        "calls_per_window": 1.0,
+        "mean_us_per_window": 74.43,
+        "name": "void fnx::k_moe_gu<(ggml_type)13; 32; 8>"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 67.47,
+        "name": "fnx::k_idx_prep_pool"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 62.71,
+        "name": "fnx::k_attn_prep_append"
+      },
+      {
+        "calls_per_window": 12.0,
+        "mean_us_per_window": 58.64,
+        "name": "fnx::k_attn_local"
+      },
+      {
+        "calls_per_window": 13.0,
+        "mean_us_per_window": 38.08,
+        "name": "fnx::k_quantize"
+      },
+      {
+        "calls_per_window": 1.0,
+        "mean_us_per_window": 9.88,
+        "name": "fnx::k_ple_gate"
+      },
+      {
+        "calls_per_window": 1.0,
+        "mean_us_per_window": 9.72,
+        "name": "fnx::k_ple_conv"
+      },
+      {
+        "calls_per_window": 1.0,
+        "mean_us_per_window": 7.51,
+        "name": "fnx::k_argmax"
+      },
+      {
+        "calls_per_window": 1.0,
+        "mean_us_per_window": 4.42,
+        "name": "fnx::k_argmax_fin"
+      },
+      {
+        "calls_per_window": 1.0,
+        "mean_us_per_window": 3.22,
+        "name": "fnx::k_hc_write"
+      },
+      {
+        "calls_per_window": 1.0,
+        "mean_us_per_window": 2.77,
+        "name": "fnx::k_swiglu_stacked"
+      }
+    ],
+    "median_graph_ms": 20.946,
+    "windows": 23
+  }
+}

@@ -1,0 +1,41 @@
+diff --git a/src/engine.cu b/src/engine.cu
+--- a/src/engine.cu
++++ b/src/engine.cu
+@@ -974,4 +974,15 @@
+     // the slots as they were, so with it the plan runs after, in moe_cache)
+     const bool live = cache_live() && lyr >= 0 && lyr < NL;
+-    const bool plan_in_router = live && !b.probe_cnt;
++    // 2026-11-19: compare a demand read from the same host-mapped weights
++    // against staging them. The expert pointer tables already identify
++    // resident slots and host copies; leave both untouched in this mode.
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++    static const bool direct = env_flag("FNX_RM400_DIRECT_COLD_EXPERTS");
++#else
++    constexpr bool direct = false;
++#endif
++    const bool stage = live && !direct;
++    const bool plan_in_router = stage && !b.probe_cnt;
+     router_route(L.router, b.mixed, b.logits, T, b.topi, b.topw, b.jobs_gu, b.jobs_dn, b.njobs, b.st, plan_in_router ? &w.ec : nullptr,
+@@ -991,3 +1002,3 @@
+         // the planned experts copied into their slots before the MoE kernels read the layer's tables
+-        if (live) moe_cache(l, L.gu_e_stride, L.down_e_stride, w.ec, b.cache_list, b.st, plan_in_router ? nullptr : b.jobs_gu, b.njobs);
++        if (stage) moe_cache(l, L.gu_e_stride, L.down_e_stride, w.ec, b.cache_list, b.st, plan_in_router ? nullptr : b.jobs_gu, b.njobs);
+     }
+diff --git a/tools/fnx_run.cpp b/tools/fnx_run.cpp
+--- a/tools/fnx_run.cpp
++++ b/tools/fnx_run.cpp
+@@ -1283,9 +1283,14 @@
+             const std::vector<int> use(lanes.begin(), lanes.begin() + k);
+             std::vector<int> xk(x.begin(), x.begin() + k);
+             std::vector<double> wall, gpu;
++            const bool fingerprint = fnx::env_flag("FNX_RM400_BATCH_FINGERPRINT");
++            uint64_t hash = 14695981039346656037ull;
+             for (int i = 0; i < n; ++i) {
+                 xk = e.step(use, xk);
++                if (fingerprint)
++                    for (int token : xk) hash = (hash ^ (uint32_t) token) * 1099511628211ull;
+                 if (i > 0) wall.push_back(e.last_ms), gpu.push_back(e.last_gpu_ms);
+             }
+             std::fprintf(stderr, "step, %d lanes, 1 row each: wall %.3f ms, gpu %.3f ms\n", k, median(wall), median(gpu));
++            if (fingerprint) std::printf("step fingerprint=%016llx\n", (unsigned long long) hash);
+         }

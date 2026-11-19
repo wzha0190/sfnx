@@ -1,0 +1,66 @@
+diff --git a/src/moe_q4k.cuh b/src/moe_q4k.cuh
+--- a/src/moe_q4k.cuh
++++ b/src/moe_q4k.cuh
+@@ -28,1 +28,10 @@
+ 
++// 2026-11-18: use vector members directly. Treating local int4 arrays as
++// scalar pointers forced stack loads/stores in nvcc's sm_70 gate/up code.
++__device__ __forceinline__ int q4k_dot4(unsigned w0, unsigned w1, unsigned w2, unsigned w3, int4 x, int acc) {
++    acc = __dp4a((int) w0, x.x, acc);
++    acc = __dp4a((int) w1, x.y, acc);
++    acc = __dp4a((int) w2, x.z, acc);
++    return __dp4a((int) w3, x.w, acc);
++}
++
+@@ -59,32 +68,33 @@
+-            const int* a0;
+-            const int* a1;
+-            int4 lo[2], hi[2];
++            int dl = 0, dh = 0, sl = 0, sh = 0;
+             if constexpr (TWIN) {
+-                // 2026-11-18: hc_read's exact, already-written dense twin.
+-                // Each 32-byte sub-block is now two aligned 16-byte loads.
++                static_assert(CACHE_SUMS, "twin path uses the cached exact sums");
+                 const int4* av = reinterpret_cast<const int4*>(tq + yoff * 32);
+-                lo[0] = av[0];
+-                lo[1] = av[1];
+-                hi[0] = av[2];
+-                hi[1] = av[3];
+-                a0 = reinterpret_cast<const int*>(lo);
+-                a1 = reinterpret_cast<const int*>(hi);
++#pragma unroll
++                for (int v = 0; v < 2; ++v) {
++                    const uint4 w = v ? q1[ii] : q0[ii];
++                    constexpr unsigned mask = 0x0f0f0f0fu;
++                    dl = q4k_dot4(w.x & mask, w.y & mask, w.z & mask, w.w & mask, av[v], dl);
++                    dh = q4k_dot4((w.x >> 4) & mask, (w.y >> 4) & mask, (w.z >> 4) & mask, (w.w >> 4) & mask,
++                                  av[2 + v], dh);
++                }
+             } else {
+-                a0 = reinterpret_cast<const int*>(yb[0].qs);
+-                a1 = reinterpret_cast<const int*>(yb[1].qs);
+-            }
+-            int dl = 0, dh = 0, sl = 0, sh = 0;
++                const int* a0 = reinterpret_cast<const int*>(yb[0].qs);
++                const int* a1 = reinterpret_cast<const int*>(yb[1].qs);
+ #pragma unroll
+-            for (int w = 0; w < 8; ++w) {
+-                const unsigned q = qw[w];
+-                const int al = a0[w], ah = a1[w];
+-                dl = __dp4a((int) (q & 0x0F0F0F0Fu), al, dl);
+-                dh = __dp4a((int) ((q >> 4) & 0x0F0F0F0Fu), ah, dh);
+-                if constexpr (!CACHE_SUMS) {
+-                    sl = __dp4a(0x01010101, al, sl);
+-                    sh = __dp4a(0x01010101, ah, sh);
++                for (int w = 0; w < 8; ++w) {
++                    const unsigned q = qw[w];
++                    const int al = a0[w], ah = a1[w];
++                    dl = __dp4a((int) (q & 0x0F0F0F0Fu), al, dl);
++                    dh = __dp4a((int) ((q >> 4) & 0x0F0F0F0Fu), ah, dh);
++                    if constexpr (!CACHE_SUMS) {
++                        sl = __dp4a(0x01010101, al, sl);
++                        sh = __dp4a(0x01010101, ah, sh);
++                    }
+                 }
+             }
+             if constexpr (CACHE_SUMS) {

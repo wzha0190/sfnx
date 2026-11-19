@@ -1,0 +1,65 @@
+diff --git a/src/dense.cuh b/src/dense.cuh
+--- a/src/dense.cuh
++++ b/src/dense.cuh
+@@ -24,5 +24,5 @@
+-template <int T, int Q8S_R, bool SPLIT, bool SEG, int TOKEN_TILE = 0>
++template <int T, int Q8S_R, bool SPLIT, bool SEG, int TOKEN_TILE = 0, int THREADS = Q8S_THREADS>
+ __device__ __forceinline__ void q8s_block(const Q8Segs& g, int rows, int cols, const block_q8_1* __restrict__ y,
+                                           const int8_t* __restrict__ tq, const float* __restrict__ td, int bx) {
+-    constexpr int Q8S_ROWS = Q8S_THREADS / 32 * Q8S_R;
++    constexpr int Q8S_ROWS = THREADS / 32 * Q8S_R;
+     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+@@ -184,2 +184,2 @@
+-template <int T> __device__ void shexp_down_blocks(const ShexpDown& s, int bx0, int nbx) {
++template <int T, int THREADS = Q8S_THREADS> __device__ void shexp_down_blocks(const ShexpDown& s, int bx0, int nbx) {
+     __shared__ __align__(16) int8_t tq[T * SH_MAXF];
+@@ -198,3 +198,3 @@
+-    const int nqb = (s.rows + Q8S_THREADS / 32 - 1) / (Q8S_THREADS / 32);
+-    for (int bx = bx0; bx < nqb; bx += nbx) q8s_block<T, 1, true, false>(s.w, s.rows, s.ffs, nullptr, tq, td, bx);
++    const int nqb = (s.rows + THREADS / 32 - 1) / (THREADS / 32);
++    for (int bx = bx0; bx < nqb; bx += nbx) q8s_block<T, 1, true, false, 0, THREADS>(s.w, s.rows, s.ffs, nullptr, tq, td, bx);
+ }
+diff --git a/src/moe_q4k.cuh b/src/moe_q4k.cuh
+--- a/src/moe_q4k.cuh
++++ b/src/moe_q4k.cuh
+@@ -131,8 +131,9 @@
+-template <int TT, bool TWIN = false, bool PRODUCER_SUMS = false, bool SHORT_GROUPS = false, bool SINGLE_JOB = false>
+-__global__ void __launch_bounds__(Q4K_THREADS) k_moe_gu_q4k(MoeW w, const Job* __restrict__ jobs, const int* __restrict__ njobs,
++template <int TT, bool TWIN = false, bool PRODUCER_SUMS = false, bool SHORT_GROUPS = false, bool SINGLE_JOB = false,
++          int THREADS = Q4K_THREADS>
++__global__ void __launch_bounds__(THREADS) k_moe_gu_q4k(MoeW w, const Job* __restrict__ jobs, const int* __restrict__ njobs,
+                                                           const block_q8_1* __restrict__ y, float* __restrict__ out, const ShexpDown sd,
+                                                           int sd_rows, const int8_t* __restrict__ tq, const float* __restrict__ td,
+                                                           const int16_t* __restrict__ producer_sums) {
+-    static_assert(Q4K_THREADS == Q8S_THREADS, "the shared expert's q8s blocks in the gate|up launch");
++    static_assert(THREADS % 32 == 0 && 32 % Q4K_LPR == 0, "keep warp and row reductions intact");
+     if ((int) blockIdx.y < sd_rows) {
+-        shexp_down_blocks<TT>(sd, blockIdx.y * gridDim.x + blockIdx.x, sd_rows * gridDim.x);
++        shexp_down_blocks<TT, THREADS>(sd, blockIdx.y * gridDim.x + blockIdx.x, sd_rows * gridDim.x);
+@@ -162,2 +163,2 @@
+-    const int row = blockIdx.x * Q4K_ROWS + threadIdx.x / Q4K_LPR, lane8 = threadIdx.x % Q4K_LPR;
++    const int row = blockIdx.x * (THREADS / Q4K_LPR) + threadIdx.x / Q4K_LPR, lane8 = threadIdx.x % Q4K_LPR;
+     const bool live = row < w.nrows;
+@@ -229,1 +230,21 @@
+                     static const bool single_job = env_flag("FNX_RM400_Q4K_SINGLE_JOB");
++                    // 2026-11-19: test scheduling granularity on the
++                    // same quantization and lane-local arithmetic.
++                    static const int threads = [] {
++                        const auto n = env_int("FNX_RM400_Q4K_GATE_THREADS", Q4K_THREADS);
++                        if (n != 128 && n != 192 && n != Q4K_THREADS)
++                            throw std::runtime_error("FNX_RM400_Q4K_GATE_THREADS: expected 128, 192 or 256");
++                        return (int) n;
++                    }();
++                    auto launch_short = [&](auto tag) {
++                        constexpr int B = decltype(tag)::value;
++                        constexpr int R = B / Q4K_LPR, S = B / 32;
++                        const int x = (w.nrows + R - 1) / R, blocks = (sd.rows + S - 1) / S;
++                        const int shared_rows = (blocks + x - 1) / x;
++                        const dim3 shape(x, njobs_max + shared_rows);
++                        k_moe_gu_q4k<TT, false, false, true, false, B><<<shape, B, 0, s>>>(
++                            w, jobs, njobs, y, out, sd, shared_rows, nullptr, nullptr, nullptr);
++                    };
++                    if constexpr (TT == 4 || TT == 6 || TT == 8) {
++                        if (!single_job && threads == 128) { launch_short(std::integral_constant<int, 128>{}); return; }
++                        if (!single_job && threads == 192) { launch_short(std::integral_constant<int, 192>{}); return; }
++                    }

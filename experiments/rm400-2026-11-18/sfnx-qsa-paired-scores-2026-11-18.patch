@@ -1,0 +1,66 @@
+diff --git a/src/qsa.cuh b/src/qsa.cuh
+--- a/src/qsa.cuh
++++ b/src/qsa.cuh
+@@ -159,3 +159,49 @@
+ }
+ 
++// 2026-11-18: consecutive decode rows share their paged keys. Take two
++// rows per CTA, but keep each dot's serial FP32 accumulation exactly.
++__global__ void __launch_bounds__(256) k_idx_score_pair(const float* __restrict__ q, const __half* __restrict__ pooled, KvPages g,
++                                                       float* __restrict__ scores, int max_pools, const int* pos0p, int T) {
++    constexpr int Q = QSA_HEADS * QSA_DIM;
++    const int t0 = blockIdx.y * 2, t1 = min(t0 + 1, T - 1);
++    const int p = *pos0p, nv0 = (p + t0 + 1) / QSA_POOL, nv1 = (p + t1 + 1) / QSA_POOL;
++    const int off = blockIdx.x * blockDim.x;
++    if (nv1 <= QSA_TOP || off >= nv1) return;
++    __shared__ float qs[2][Q];
++    for (int k = threadIdx.x; k < Q; k += blockDim.x) {
++        qs[0][k] = q[(size_t) t0 * Q + k];
++        qs[1][k] = q[(size_t) t1 * Q + k];
++    }
++    __syncthreads();
++    const int j = off + threadIdx.x;
++    if (j >= nv1) return;
++    const uint4* kr = reinterpret_cast<const uint4*>(pooled + kvp_block(g, j));
++    float d[2][QSA_HEADS] = {};
++#pragma unroll 4
++    for (int c = 0; c < QSA_DIM / 8; ++c) {
++        const uint4 u = kr[c];
++        const __half2* h2 = reinterpret_cast<const __half2*>(&u);
++#pragma unroll
++        for (int k = 0; k < 4; ++k) {
++            const float2 kv = __half22float2(h2[k]);
++            const int dim = c * 8 + 2 * k;
++#pragma unroll
++            for (int r = 0; r < 2; ++r)
++#pragma unroll
++                for (int h = 0; h < QSA_HEADS; ++h)
++                    d[r][h] = fmaf(qs[r][h * QSA_DIM + dim], kv.x, fmaf(qs[r][h * QSA_DIM + dim + 1], kv.y, d[r][h]));
++        }
++    }
++    const float w = rsqrtf((float) QSA_DIM);
++    float s0 = 0.f, s1 = 0.f;
++#pragma unroll
++    for (int h = 0; h < QSA_HEADS; ++h) {
++        s0 += fmaxf(d[0][h], 0.f) * w;
++        s1 += fmaxf(d[1][h], 0.f) * w;
++    }
++    if (nv0 > QSA_TOP && j < nv0) scores[(size_t) t0 * max_pools + j] = s0;
++    if (t1 != t0) scores[(size_t) t1 * max_pools + j] = s1;
++}
++
+ // the same for a prompt's rows on the tensor cores: a block takes 16 rows (their 4 heads: 64 rows of q, in f16 high and
+diff --git a/src/kernels.cu b/src/kernels.cu
+--- a/src/kernels.cu
++++ b/src/kernels.cu
+@@ -1261,2 +1261,10 @@
+-    k_idx_score<<<dim3((max_pools + 255) / 256, T), 256, 0, s>>>(q, pl, g, scores, max_pools, pos0, LaneRows{});
++    const int tiles = (max_pools + 255) / 256;
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++    static const bool paired = env_flag("FNX_RM400_QSA_PAIRED");
++    if (paired && T > 1)
++        k_idx_score_pair<<<dim3(tiles, (T + 1) / 2), 256, 0, s>>>(q, pl, g, scores, max_pools, pos0, T);
++    else
++#endif
++        k_idx_score<<<dim3(tiles, T), 256, 0, s>>>(q, pl, g, scores, max_pools, pos0, LaneRows{});
+     k_idx_select<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, pos0, card, LaneRows{});

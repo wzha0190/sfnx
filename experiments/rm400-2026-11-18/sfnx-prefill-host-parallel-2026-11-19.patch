@@ -1,0 +1,40 @@
+diff --git a/src/prefill.cu b/src/prefill.cu
+--- a/src/prefill.cu
++++ b/src/prefill.cu
+@@ -916,10 +916,31 @@
+     };
++    // 2026-11-19: the first pass's RAM rows are on the critical path.
++    // Parallelize only host preparation, with disjoint output ranges and
++    // the same lookup/dequantization routine. The disk gather stays whole.
++    static const bool host_parallel = env_flag("FNX_RM400_PF_HOST_PARALLEL");
++    static const bool host_timing = env_flag("FNX_RM400_PF_HOST_TIMING");
++    const bool ram = m_.ple_rows->mode() == PleRows::Mode::RAM;
+     auto embed = [&](size_t i0, const std::vector<PfChunk>& ch) {
+         size_t i = i0;
+         for (const PfChunk& c : ch) {
+-            embed_rows(h0 + (int) i, (int) c.tokens.size(), tok_at, pf_emb_[c.set], pf_ple_[c.set]);
++            const int begin = h0 + (int) i, n = (int) c.tokens.size();
++            float* const emb = pf_emb_[c.set];
++            float* const ple = pf_ple_[c.set];
++            if (host_parallel && ram && i0 == 0 && n >= 256) {
++                const auto prepare = [&](int part) {
++                    const int lo = part * n / 4, hi = (part + 1) * n / 4;
++                    embed_rows(begin + lo, hi - lo, tok_at, emb + (size_t) lo * N, ple + (size_t) lo * N);
++                };
++                // Destroy/join futures before the callable on any exception.
++                std::future<void> workers[3];
++                for (int w = 0; w < 3; ++w) workers[w] = std::async(std::launch::async, prepare, w);
++                prepare(3);
++                for (auto& worker : workers) worker.get();
++            } else {
++                embed_rows(begin, n, tok_at, emb, ple);
++            }
+             i += c.tokens.size();
+         }
+     };
+     std::vector<PfChunk> ch = chunks_of(0, 0, first);
++    const auto embed_begin = std::chrono::steady_clock::now();
+     embed(0, ch);
++    if (host_timing)
++        std::fprintf(stderr, "prefill host first pass: %zu rows, %.3f ms\n", std::min(nt, first),
++                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - embed_begin).count());

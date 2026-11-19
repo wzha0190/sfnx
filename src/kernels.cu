@@ -867,6 +867,109 @@ __global__ void k_ring(Ring r, float* x, int T, const unsigned* tagp, int call, 
     }
 }
 
+// ---------------------------------------------------------------- ring sum, three fp16 values a word (Ring::r3)
+// k_ring's steps, chunks and roundings with the 27B's words (s27_ring3.cuh: three fp16 values | a 16-bit tag): a third
+// fewer words. Each of k_ring's chunks (pairs clo(k)..chi(k)) is cut into its own triples, its last padded with zeros,
+// so every element is summed by the same cards in the same order as on k_ring: the same bits.
+// On three V100s behind one EPYC 7443 (PCIe Gen3, ~10 GB/s a pair of cards) the ring's ~41-110 KB hops are mostly
+// latency: a 41 KB hop's stores run at 2.7 GB/s, a 1 MB one's at 9.9 (tools/p2p_store_bench). There, storing straight to
+// the chunk's card and from it to every card (two waits a sum, not four) measured slower at every workload (edit1
+// 38.5 against 28.1 ms a round, code1 22.2 against 18.2, prose2 16.9 against 15.0), as did the attention partials stored
+// straight into the heads' card (30.7, 18.9, 15.5): a card's stores to two peers at once cost more there than the
+// ring's extra hops, as on the two-socket box
+__host__ __device__ constexpr int f3_e0(int k) { return 2 * (k * NP / NCARD); }              // chunk k's first element
+__host__ __device__ constexpr int f3_n(int k) { return (f3_e0(k + 1) - f3_e0(k) + 2) / 3; }   // its triples
+__host__ __device__ constexpr int f3_to(int k) {                                            // its first triple in a row
+    int s = 0;
+    for (int i = 0; i < k; ++i) s += f3_n(i);
+    return s;
+}
+constexpr int F3_NT = f3_to(NCARD);   // triples a row
+constexpr int F3_CH = (2 * (NP / NCARD + 1) + 2) / 3;   // a chunk's triples, at most
+// the buffers are sized for fp32 words (two a pair: 2 RCH a slot row, 2 N an ag row)
+static_assert(F3_CH <= 2 * RCH && F3_NT <= 2 * N && f3_e0(NCARD) == N, "the triples fit the ring's buffers and cover a row");
+__device__ __forceinline__ float f3_x(const float* x, const RingMoe& m, int T, int t, int j, int end) {
+    return j < end ? ring_x(x, m, T, t, j) : 0.f;
+}
+__device__ __forceinline__ void f3_put(unsigned long long* p, float a, float b, float c, unsigned tag, unsigned* err) {
+    if (!(fabsf(a) <= RING_MAX && fabsf(b) <= RING_MAX && fabsf(c) <= RING_MAX)) atomicOr(err, 2u);   // out of range (or NaN)
+    const unsigned long long w = (unsigned long long) __half_as_ushort(__float2half_rn(a)) |
+                                 (unsigned long long) __half_as_ushort(__float2half_rn(b)) << 16 |
+                                 (unsigned long long) __half_as_ushort(__float2half_rn(c)) << 32 | (unsigned long long) (tag & 0xffffu) << 48;
+    *(volatile unsigned long long*) p = w;
+}
+__device__ __forceinline__ float3 f3_take(const unsigned long long* p, unsigned tag, unsigned* err) {
+    const long long t0 = clock64();
+    unsigned long long w;
+    for (;;) {
+        w = *(const volatile unsigned long long*) p;
+        if ((unsigned) (w >> 48) == (tag & 0xffffu)) break;
+        if (clock64() - t0 > 4000000000LL) { atomicOr(err, 1u); break; }
+    }
+    return make_float3(__half2float(__ushort_as_half((unsigned short) w)), __half2float(__ushort_as_half((unsigned short) (w >> 16))),
+                       __half2float(__ushort_as_half((unsigned short) (w >> 32))));
+}
+
+__global__ void __launch_bounds__(256) k_ring3f(Ring r, float* x, int T, const unsigned* tagp, int call, RingMoe m) {
+    const unsigned tag = *tagp * 256u + (unsigned) call + 1u;
+    const int n = gridDim.x * blockDim.x, tid = blockIdx.x * blockDim.x + threadIdx.x, g = r.card, set = tag & 1;
+    const size_t in_set = (size_t) RSTEPS * r.rows * F3_CH, ag_set = (size_t) r.rows * F3_NT;
+    unsigned long long* in = (unsigned long long*) r.in + set * in_set;
+    unsigned long long* nin = (unsigned long long*) r.next_in + set * in_set;
+    unsigned long long* ag = (unsigned long long*) r.ag + set * ag_set;
+    unsigned long long* nag = (unsigned long long*) r.next_ag + set * ag_set;
+    auto slot = [&](unsigned long long* b, int s, int t, int i) { return b + ((size_t) s * r.rows + t) * F3_CH + i; };
+    // this card's addends of chunk c's triple i, row t, plus a
+    auto mine = [&](int c, int t, int i, float3 a) {
+        const int j = f3_e0(c) + 3 * i, end = f3_e0(c + 1);
+        return make_float3(a.x + f3_x(x, m, T, t, j, end), a.y + f3_x(x, m, T, t, j + 1, end), a.z + f3_x(x, m, T, t, j + 2, end));
+    };
+    {   // step 0: my part of chunk g to g+1, as it is (not 0 + it: that would turn a -0 into +0)
+        const int len = f3_n(g), e0 = f3_e0(g), end = f3_e0(g + 1);
+        for (int e = tid; e < T * len; e += n) {
+            const int t = e / len, i = e % len, j = e0 + 3 * i;
+            f3_put(slot(nin, 0, t, i), f3_x(x, m, T, t, j, end), f3_x(x, m, T, t, j + 1, end), f3_x(x, m, T, t, j + 2, end), tag, r.err);
+        }
+    }
+#pragma unroll
+    for (int s = 1; s < RSTEPS; ++s) {   // step s: chunk g-s arrived with s parts; add mine, on to g+1
+        const int c = (g + NCARD - s) % NCARD, len = f3_n(c);
+        for (int e = tid; e < T * len; e += n) {
+            const int t = e / len, i = e % len;
+            const float3 v = mine(c, t, i, f3_take(slot(in, s - 1, t, i), tag, r.err));
+            f3_put(slot(nin, s, t, i), v.x, v.y, v.z, tag, r.err);
+        }
+    }
+    {   // step NCARD - 1: chunk g+1 with the other cards' parts; add mine: finished. Keep it, send it on
+        const int c = (g + 1) % NCARD, to = f3_to(c), len = f3_n(c);
+        for (int e = tid; e < T * len; e += n) {
+            const int t = e / len, i = e % len;
+            const float3 v = mine(c, t, i, f3_take(slot(in, RSTEPS - 1, t, i), tag, r.err));
+            f3_put(ag + (size_t) t * F3_NT + to + i, v.x, v.y, v.z, tag, r.err);
+            f3_put(nag + (size_t) t * F3_NT + to + i, v.x, v.y, v.z, tag, r.err);
+        }
+    }
+#pragma unroll
+    for (int f = 1; f < RSTEPS; ++f) {   // chunk g-f+1 arrived finished from g-1: forward it (none on two cards)
+        const int c = (g + NCARD - f + 1) % NCARD, to = f3_to(c), len = f3_n(c);
+        for (int e = tid; e < T * len; e += n) {
+            const int t = e / len, i = e % len;
+            const float3 v = f3_take(ag + (size_t) t * F3_NT + to + i, tag, r.err);
+            f3_put(nag + (size_t) t * F3_NT + to + i, v.x, v.y, v.z, tag, r.err);
+        }
+    }
+    for (int e = tid; e < T * F3_NT; e += n) {   // everything back into x
+        const int t = e / F3_NT, q = e % F3_NT;
+        int c = 0;
+        while (q >= f3_to(c + 1)) ++c;
+        const int j = f3_e0(c) + 3 * (q - f3_to(c)), end = f3_e0(c + 1);
+        const float3 v = f3_take(ag + e, tag, r.err);
+        x[(size_t) t * N + j] = v.x;
+        if (j + 1 < end) x[(size_t) t * N + j + 1] = v.y;
+        if (j + 2 < end) x[(size_t) t * N + j + 2] = v.z;
+    }
+}
+
 // ---------------------------------------------------------------- argmax
 // a float's bits made monotone as unsigned (larger float, larger key)
 __device__ __forceinline__ unsigned fkey(float v) {
@@ -1428,6 +1531,14 @@ void ring_sum(const Ring& r, float* x, int T, const unsigned* tag, int call, voi
         k_ring_big<<<grid, 256, 0, (cudaStream_t) st>>>(r, x, T, tag, call, m);
         k_ring_big_out<<<grid, 256, 0, (cudaStream_t) st>>>(r, x, T, tag, call);
         ck_launch("ring_sum (chunk)");
+        return;
+    }
+    if (r.r3) {
+        if (r.f32) throw std::runtime_error("ring_sum: three fp16 values a word (FNX_RING3) with fp32 sums (FNX_RING_F32)");
+        if (T > MAXT) throw std::runtime_error("ring_sum: three values a word carry decode's windows only (16-bit tags)");
+        const int grid = std::max(4, std::min(40, (T * F3_CH + 255) / 256));
+        k_ring3f<<<grid, 256, 0, (cudaStream_t) st>>>(r, x, T, tag, call, m);
+        ck_launch("ring_sum (three a word)");
         return;
     }
     const int grid = std::max(4, std::min(T > MAXT ? 240 : 40, (T * NP / NCARD + 255) / 256));

@@ -1,0 +1,69 @@
+diff --git a/src/engine.hpp b/src/engine.hpp
+--- a/src/engine.hpp
++++ b/src/engine.hpp
+@@ -153,1 +153,5 @@
+     int pos() const { return pos_; }
++    // fnx_run bench alone commits exactly one row. Keep row 0's rollback
++    // snapshot but skip all later snapshots to price compact rollback.
++    void bench_first_snapshot() { bench_first_snapshot_ = true; }
++
+@@ -191,1 +195,2 @@
+     int max_ctx_, pos_ = 0;
++    bool bench_first_snapshot_ = false;
+diff --git a/src/engine.cu b/src/engine.cu
+--- a/src/engine.cu
++++ b/src/engine.cu
+@@ -1028,2 +1028,2 @@
+                 gdn_core(b.qkvz, b.ab, b.chist[l], L.conv, L.dt_bias, L.ssm_a, L.ssm_norm, b.S[l], b.xq, b.ctl, b.gdn_scratch, b.snap[l],
+-                         b.hsnap[l], w.nk, nv, w.vmap, T, eps, b.st);
++                         b.hsnap[l], w.nk, nv, w.vmap, T, eps, b.st, nullptr, bench_first_snapshot_);
+diff --git a/src/engine_common.cu b/src/engine_common.cu
+--- a/src/engine_common.cu
++++ b/src/engine_common.cu
+@@ -528,2 +528,4 @@
+     if (n < 1 || n > T) throw std::runtime_error("commit: keep 1..T rows");
++    if (bench_first_snapshot_ && n > 1 && n < T)
++        throw std::runtime_error("snapshot ceiling diagnostic can only roll back to row 0");
+     if (n < T) {
+diff --git a/src/kernels.hpp b/src/kernels.hpp
+--- a/src/kernels.hpp
++++ b/src/kernels.hpp
+@@ -93,1 +93,1 @@
+-              const int* vmap, int T, float eps, void* st, float* y32 = nullptr);
++              const int* vmap, int T, float eps, void* st, float* y32 = nullptr, bool first_snapshot = false);
+@@ -103,2 +103,3 @@
+     float* hsnap = nullptr;
++    bool first_snapshot = false;
+ };
+diff --git a/src/kernels.cu b/src/kernels.cu
+--- a/src/kernels.cu
++++ b/src/kernels.cu
+@@ -1740,3 +1740,3 @@
+               float* S, void* yq, const int* ctl, float* scratch, float* snap, float* hsnap, int nk, int nv, const int* vmap, int T,
+-              float eps, void* st, float* y32) {
++              float eps, void* st, float* y32, bool first_snapshot) {
+     cudaStream_t s = (cudaStream_t) st;
+@@ -1746,3 +1746,5 @@
+     twin_of(yq, nv * HS, tq, td);
+-#define FNX_GDN(t) k_gdn_core<t><<<nv * GDN_Q, GDN_THREADS, 0, s>>>(qkvz, ab, hist, convw, dt, a, nw, S, y, ctl, scratch, snap, hsnap, nk, nv, vmap, eps, tq, td, y32, GdnLanes{})
++    GdnLanes gl{};
++    gl.first_snapshot = first_snapshot;
++#define FNX_GDN(t) k_gdn_core<t><<<nv * GDN_Q, GDN_THREADS, 0, s>>>(qkvz, ab, hist, convw, dt, a, nw, S, y, ctl, scratch, snap, hsnap, nk, nv, vmap, eps, tq, td, y32, gl)
+     switch (T) {
+diff --git a/src/gdn_core.cuh b/src/gdn_core.cuh
+--- a/src/gdn_core.cuh
++++ b/src/gdn_core.cuh
+@@ -168,2 +168,4 @@
+         ov[t] = at * scale;
+-        if (t < T - 1) {
++        // 2026-11-18 diagnostic: keep the one rollback point fnx_run bench
++        // actually consumes. The full intermediate values are still computed.
++        if (t < T - 1 && (!gl.first_snapshot || t == 0)) {
+diff --git a/tools/fnx_run.cpp b/tools/fnx_run.cpp
+--- a/tools/fnx_run.cpp
++++ b/tools/fnx_run.cpp
+@@ -1281,3 +1281,4 @@
+         if (argc < 6) { std::fprintf(stderr, "bench needs T N\n"); return 2; }
+         const int T = std::atoi(argv[4]), n = std::atoi(argv[5]);
++        if (fnx::env_flag("FNX_RM400_FIRST_SNAPSHOT")) e.bench_first_snapshot();
+         // FNX_BENCH_CTX=N: the windows at a context of N tokens (the prompt repeated, read through the prompt path)

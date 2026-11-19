@@ -1,0 +1,50 @@
+diff --git a/src/engine.cu b/src/engine.cu
+--- a/src/engine.cu
++++ b/src/engine.cu
+@@ -975,11 +975,26 @@
+     // the shared expert (rows P + t of part): its gate|up in the router's launch and its swiglu and down in the routed
+     // gate|up's (Q4_K experts), else on the second stream (a fork and a join cost ~5 us more than the launches' blocks)
+-    const bool sh_in = L.gu_e.type == T_Q4_K && L.sh_gu.s.q && L.sh_down.s.q && ffs % 32 == 0 && ffs <= SH_MAXF;
+-    if (!sh_in) {
++    const bool can_fuse = L.gu_e.type == T_Q4_K && L.sh_gu.s.q && L.sh_down.s.q && ffs % 32 == 0 && ffs <= SH_MAXF;
++    // 2026-11-19: reuse the existing second-stream path to quantize
++    // shared SwiGLU once (1) or move the entire shared expert (2).
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++    static const int shared_layout = [] {
++        const auto n = env_int("FNX_RM400_SHARED_EXPERT_LAYOUT", 0);
++        if (n < 0 || n > 2) throw std::runtime_error("FNX_RM400_SHARED_EXPERT_LAYOUT: expected 0..2");
++        return (int) n;
++    }();
++#else
++    constexpr int shared_layout = 0;
++#endif
++    const int layout = (T >= 4 && T <= 8) ? shared_layout : 0;
++    const bool fused_up = can_fuse && layout != 2;
++    const bool fused_down = can_fuse && layout == 0;
++    const auto shared_side = [&](bool run_up) {
+         ck(cudaEventRecord(b.fork, b.st), "fork");
+         ck(cudaStreamWaitEvent(b.st2, b.fork, 0), "fork wait");
+-        q8s_gemv(L.sh_gu.s, 2 * ffs, N, b.xq, b.sh_gu, 2 * ffs, T, b.st2);
++        if (run_up) q8s_gemv(L.sh_gu.s, 2 * ffs, N, b.xq, b.sh_gu, 2 * ffs, T, b.st2);
+         swiglu_stacked_q8_1(b.sh_gu, b.sh_hq, ffs, T, b.st2);
+         q8s_gemv(L.sh_down.s, N, ffs, b.sh_hq, b.part + (size_t) P * N, N, T, b.st2);
+         ck(cudaEventRecord(b.join, b.st2), "join");
+-    }
++    };
++    if (!fused_up) shared_side(true);
+@@ -1000,3 +1015,4 @@
+     router_route(L.router, b.mixed, b.logits, T, b.topi, b.topw, b.jobs_gu, b.jobs_dn, b.njobs, b.st, plan_in_router ? &w.ec : nullptr,
+-                 lyr, b.cache_list, sh_in ? &L.sh_gu.s : nullptr, 2 * ffs, b.xq, b.sh_gu);
++                 lyr, b.cache_list, fused_up ? &L.sh_gu.s : nullptr, 2 * ffs, b.xq, b.sh_gu);
++    if (fused_up && !fused_down) shared_side(false);
+     if (const int l = lyr; l >= 0 && l < NL) {
+@@ -1017,7 +1033,7 @@
+-    if (sh_in)
++    if (fused_down)
+         moe_gate_up(L.gu_e, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st, &L.sh_down.s, ffs, b.sh_gu,
+                     b.part + (size_t) P * N, q4k_sums);
+     else
+         moe_gate_up(L.gu_e, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st, nullptr, 0, nullptr, nullptr, q4k_sums);
+     moe_down(L.down_e, L.down_e_stride, b.jobs_dn, b.njobs, P, b.gu, b.part, b.st);
+-    if (!sh_in) ck(cudaStreamWaitEvent(b.st, b.join, 0), "join wait");
++    if (!fused_down) ck(cudaStreamWaitEvent(b.st, b.join, 0), "join wait");

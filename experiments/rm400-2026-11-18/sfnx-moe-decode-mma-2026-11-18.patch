@@ -1,0 +1,86 @@
+diff --git a/tools/moe_mma_bench.cu b/tools/moe_mma_bench.cu
+--- a/tools/moe_mma_bench.cu
++++ b/tools/moe_mma_bench.cu
+@@ -24,7 +24,23 @@
+-static float time_ms(const std::function<void()>& f, int reps = 10) {
++// 2026-11-18 decode diagnostic: same cold-L2 read as upstream kbench.
++static float time_ms(const std::function<void()>& f, int reps = 33) {
++    static void* flush = nullptr;
++    constexpr size_t bytes = 24u << 20;
++    if (!flush) {
++        if (cudaMalloc(&flush, bytes) != cudaSuccess || cudaMemset(flush, 0, bytes) != cudaSuccess)
++            throw std::runtime_error("cannot allocate L2 flush buffer");
++    }
+     cudaEvent_t a, b;
+     cudaEventCreate(&a);
+     cudaEventCreate(&b);
+     f();
+-    cudaDeviceSynchronize();
+-    cudaEventRecord(a);
+-    for (int i = 0; i < reps; ++i) f();
+-    cudaEventRecord(b);
+-    cudaEventSynchronize(b);
+-    float ms = 0.f;
+-    cudaEventElapsedTime(&ms, a, b);
+-    return ms / reps;
++    std::vector<float> times;
++    for (int i = 0; i < reps; ++i) {
++        l2_prefetch(flush, bytes, nullptr);
++        cudaEventRecord(a);
++        f();
++        cudaEventRecord(b);
++        if (cudaEventSynchronize(b) != cudaSuccess) throw std::runtime_error("timed CUDA launch failed");
++        float ms = 0.f;
++        cudaEventElapsedTime(&ms, a, b);
++        times.push_back(ms);
++    }
++    cudaEventDestroy(a);
++    cudaEventDestroy(b);
++    std::sort(times.begin(), times.end());
++    return times[times.size() / 2];
+ }
+@@ -143,2 +143,5 @@
+         // routing: 10 distinct experts per token; gate|up jobs read token rows, down jobs read pair rows
++        std::vector<int> common(NEXP);
++        for (int i = 0; i < NEXP; ++i) common[i] = i;
++        std::shuffle(common.begin(), common.end(), rng);
+         std::vector<std::vector<int>> per(NEXP);
+@@ -150,4 +153,8 @@
+             std::shuffle(e.begin(), e.end(), rng);
++            e.erase(std::remove_if(e.begin(), e.end(), [&](int id) {
++                return std::find(common.begin(), common.begin() + 5, id) != common.begin() + 5;
++            }), e.end());
++            e.insert(e.begin(), common.begin(), common.begin() + 5);
+             for (int k = 0; k < TOPK; ++k) {
+@@ -184,1 +191,22 @@
+-        const float tg1 = time_ms([&] { moe_gate_up_big(gu.w, gu.stride, dgu, dnj, nj, xq, g1, nullptr); });
++        if (C < 1 || C > MAXT) throw std::runtime_error("decode diagnostic requires 1..MAXT rows");
++        std::vector<Job> small_gu(nj), small_dn(nj);
++        for (int j = 0; j < nj; ++j) {
++            for (int is_down = 0; is_down < 2; ++is_down) {
++                const BigJob& big = is_down ? jdn[j] : jgu[j];
++                Job& small = is_down ? small_dn[j] : small_gu[j];
++                small.w = big.w;
++                small.n = big.n;
++                std::copy_n(big.y, big.n, small.y);
++                std::copy_n(big.out, big.n, small.out);
++            }
++        }
++        Job *sgu, *sdn;
++        cudaMalloc(&sgu, nj * sizeof(Job));
++        cudaMalloc(&sdn, nj * sizeof(Job));
++        cudaMemcpy(sgu, small_gu.data(), nj * sizeof(Job), cudaMemcpyHostToDevice);
++        cudaMemcpy(sdn, small_dn.data(), nj * sizeof(Job), cudaMemcpyHostToDevice);
++        const float tg1 = time_ms([&] {
++            moe_gate_up(gu.w, gu.stride, sgu, dnj, P, xq, g1, nullptr);
++        });
+@@ -186,1 +214,3 @@
+-        const float td1 = time_ms([&] { moe_down_big(dn.w, dn.stride, ddn, dnj, nj, g2, o1, nullptr); });
++        const float td1 = time_ms([&] { moe_down(dn.w, dn.stride, sdn, dnj, P, g2, o1, nullptr); });
++        cudaFree(sgu);
++        cudaFree(sdn);
+@@ -221,2 +251,2 @@
+-        std::printf("C=%5d (%4d jobs) gate|up: q8_1 %6.2f ms (err %.2g), mma %6.2f ms (err %.2g) of %.3g | down: q8_1 %6.2f ms (err %.2g), "
+-                    "swiglu %.2f + mma %6.2f ms (err %.2g) of %.3g %s\n",
++        std::printf("C=%5d (%4d jobs) gate|up: q8_1 %7.3f ms (err %.2g), mma %7.3f ms (err %.2g) of %.3g | down: q8_1 %7.3f ms (err %.2g), "
++                    "swiglu %.3f + mma %7.3f ms (err %.2g) of %.3g %s\n",
