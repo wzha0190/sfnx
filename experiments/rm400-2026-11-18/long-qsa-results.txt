@@ -1,0 +1,12 @@
+./batch-a1.log:step, 6 lanes, 1 row each: wall 20.711 ms, gpu 20.648 ms
+./batch-a2.log:step, 6 lanes, 1 row each: wall 20.695 ms, gpu 20.619 ms
+./batch-paired.log:step, 6 lanes, 1 row each: wall 20.673 ms, gpu 20.607 ms
+./batch-striped.log:step, 6 lanes, 1 row each: wall 20.705 ms, gpu 20.639 ms
+./bench-a1-8.log:bench 127 windows of 8 rows: wall median 20.483 trimmed 20.479 ms, gpu median 20.410 trimmed 20.403 ms
+./bench-a1-8.log:bench top1 fingerprint=6c77da08437c3d85 keep=1 loop 21.037 ms/window
+./bench-a2-8.log:bench 127 windows of 8 rows: wall median 20.504 trimmed 20.489 ms, gpu median 20.436 trimmed 20.421 ms
+./bench-a2-8.log:bench top1 fingerprint=6c77da08437c3d85 keep=1 loop 21.062 ms/window
+./bench-paired-8.log:bench 127 windows of 8 rows: wall median 20.452 trimmed 20.442 ms, gpu median 20.373 trimmed 20.371 ms
+./bench-paired-8.log:bench top1 fingerprint=6c77da08437c3d85 keep=1 loop 21.051 ms/window
+./bench-striped-8.log:bench 127 windows of 8 rows: wall median 20.502 trimmed 20.505 ms, gpu median 20.436 trimmed 20.437 ms
+./bench-striped-8.log:bench top1 fingerprint=6c77da08437c3d85 keep=1 loop 21.086 ms/window

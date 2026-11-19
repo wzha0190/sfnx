@@ -1,0 +1,8 @@
+./long-a1.log:step, 6 lanes, 1 row each: wall 20.720 ms, gpu 20.653 ms
+./long-a2.log:step, 6 lanes, 1 row each: wall 20.715 ms, gpu 20.649 ms
+./long-g320.log:step, 6 lanes, 1 row each: wall 20.766 ms, gpu 20.697 ms
+./long-g80.log:step, 6 lanes, 1 row each: wall 20.734 ms, gpu 20.672 ms
+./short-a1.log:step, 6 lanes, 1 row each: wall 19.476 ms, gpu 19.408 ms
+./short-a2.log:step, 6 lanes, 1 row each: wall 19.488 ms, gpu 19.426 ms
+./short-g320.log:step, 6 lanes, 1 row each: wall 19.499 ms, gpu 19.436 ms
+./short-g80.log:step, 6 lanes, 1 row each: wall 19.464 ms, gpu 19.404 ms

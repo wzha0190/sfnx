@@ -1,7 +1,7 @@
 # RM400 long-context follow-up screens
 
 These results are lab wall times, not hot API promotion measurements. Use
-this branch's deployed engine as control, `ARCH=70 FNX_NCARD=3`, and
+the deployed settings in each lab stack, `ARCH=70 FNX_NCARD=3`, and
 [restart the worker for every flag profile](lab-worker-flags.md).
 
 ### Long-context sparse selection and expert copy (2026-11-19)
@@ -83,9 +83,8 @@ eight-row verification. All solo and six-lane greedy fingerprints matched.
 
 The combined settings reduced the six-row median by 1.36%, less than
 the promotion threshold, while sacrificing initial K/V capacity. Leave
-production at the pinned defaults. A separate all-hit cache-planner screen
-keeps the 3 GiB policy unchanged: it measures whether skipping temporary
-eviction pins on hit-only layers is better than the existing CLOCK path.
+production at the pinned defaults. See the separate [all-hit planner experiment](cache-all-hit.md),
+which kept the 3 GiB placement policy.
 
 
 ### CPU speculative-lookup scan (2026-11-19)
@@ -135,3 +134,20 @@ The patches apply with `git apply --recount --unidiff-zero`.
 - Lookup: apply the AVX2 patch and run
   `python3 experiments/rm400-2026-11-18/check-sfnx-lookup-avx2.py < src/session.cpp`
   on an AVX2-capable CPU. No model, CUDA context or service interruption needed.
+
+## Exact per-run lab source and timings
+
+For a clean reproduction, check out upstream
+`980873394a532ca0f187aae034ed4819bb205921`, then `git apply` the one full
+stack below for the chosen run. Do not stack the files in this table.
+Match the flag profile above and the recorded fixtures; the patches live
+in the experiment directory, not in the default build. They include
+prior dormant prototypes that were present in the measured binary.
+
+| Lab run | Full source SHA-256 | Extracted timing lines |
+|---|---|---|
+| [long-qsa-stack.patch](long-qsa-stack.patch) | `6f6fa36dac0ec1e782997dd593dcfe547e145fa59346c0218889ed4324e5a5aa` | [long-qsa-results.txt](long-qsa-results.txt) |
+| [decode-copy-grid-stack.patch](decode-copy-grid-stack.patch) | `76433740167bf21dc80cb01d52e7fb00046b1a289ff37ae8049187efd2163e2e` | [decode-copy-grid-results.txt](decode-copy-grid-results.txt) |
+| [cold-expert-read-stack.patch](cold-expert-read-stack.patch) | `6149321087ff4e0f15c4a2fceb203eaf7d53c0c130d448ddad22fda2024b4260` | [cold-expert-read-results.txt](cold-expert-read-results.txt) |
+| [expert-placement-stack.patch](expert-placement-stack.patch) | `6a27236d70246e1dc3f5b9e7ee19e220163a2bf20676c85664f950d5b567da00` | [expert-placement-results.txt](expert-placement-results.txt) |
+| [cache-residency-stack.patch](cache-residency-stack.patch) | `6a27236d70246e1dc3f5b9e7ee19e220163a2bf20676c85664f950d5b567da00` | [cache-residency-results.txt](cache-residency-results.txt) |
