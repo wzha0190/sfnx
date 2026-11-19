@@ -1,0 +1,32 @@
+solo-a1-16384.log:bench 199 windows of 8 rows: wall median 20.158 trimmed 20.160 ms, gpu median 20.090 trimmed 20.093 ms
+solo-a1-16384.log:bench top1 fingerprint=9b6f2f0f5d28641d keep=1 loop 20.290 ms/window
+solo-a1-4096.log:bench 199 windows of 6 rows: wall median 17.181 trimmed 17.178 ms, gpu median 17.129 trimmed 17.118 ms
+solo-a1-4096.log:bench top1 fingerprint=bfbb8d26a72ce1c1 keep=1 loop 17.306 ms/window
+solo-a1-512.log:bench 199 windows of 4 rows: wall median 13.937 trimmed 13.933 ms, gpu median 13.886 trimmed 13.880 ms
+solo-a1-512.log:bench top1 fingerprint=ca71428877ed6815 keep=1 loop 14.304 ms/window
+solo-a2-16384.log:bench 199 windows of 8 rows: wall median 20.164 trimmed 20.168 ms, gpu median 20.089 trimmed 20.092 ms
+solo-a2-16384.log:bench top1 fingerprint=9b6f2f0f5d28641d keep=1 loop 20.295 ms/window
+solo-a2-4096.log:bench 199 windows of 6 rows: wall median 17.194 trimmed 17.187 ms, gpu median 17.129 trimmed 17.127 ms
+solo-a2-4096.log:bench top1 fingerprint=bfbb8d26a72ce1c1 keep=1 loop 17.317 ms/window
+solo-a2-512.log:bench 199 windows of 4 rows: wall median 13.938 trimmed 13.934 ms, gpu median 13.888 trimmed 13.881 ms
+solo-a2-512.log:bench top1 fingerprint=ca71428877ed6815 keep=1 loop 14.326 ms/window
+solo-b1-16384.log:bench 199 windows of 8 rows: wall median 19.677 trimmed 19.669 ms, gpu median 19.595 trimmed 19.587 ms
+solo-b1-16384.log:bench top1 fingerprint=9b6f2f0f5d28641d keep=1 loop 19.779 ms/window
+solo-b1-4096.log:bench 199 windows of 6 rows: wall median 16.842 trimmed 16.831 ms, gpu median 16.756 trimmed 16.753 ms
+solo-b1-4096.log:bench top1 fingerprint=bfbb8d26a72ce1c1 keep=1 loop 16.933 ms/window
+solo-b1-512.log:bench 199 windows of 4 rows: wall median 13.706 trimmed 13.694 ms, gpu median 13.658 trimmed 13.643 ms
+solo-b1-512.log:bench top1 fingerprint=ca71428877ed6815 keep=1 loop 14.074 ms/window
+solo-b2-16384.log:bench 199 windows of 8 rows: wall median 19.644 trimmed 19.652 ms, gpu median 19.570 trimmed 19.581 ms
+solo-b2-16384.log:bench top1 fingerprint=9b6f2f0f5d28641d keep=1 loop 19.783 ms/window
+solo-b2-4096.log:bench 199 windows of 6 rows: wall median 16.810 trimmed 16.801 ms, gpu median 16.756 trimmed 16.743 ms
+solo-b2-4096.log:bench top1 fingerprint=bfbb8d26a72ce1c1 keep=1 loop 16.932 ms/window
+solo-b2-512.log:bench 199 windows of 4 rows: wall median 13.706 trimmed 13.697 ms, gpu median 13.656 trimmed 13.642 ms
+solo-b2-512.log:bench top1 fingerprint=ca71428877ed6815 keep=1 loop 14.079 ms/window
+batch-a1-4096.log:step, 6 lanes, 1 row each: wall 19.545 ms, gpu 19.479 ms
+batch-a1-4096.log:step fingerprint=6fff13dc1fbcfebc
+batch-a2-4096.log:step, 6 lanes, 1 row each: wall 19.556 ms, gpu 19.482 ms
+batch-a2-4096.log:step fingerprint=6fff13dc1fbcfebc
+batch-b1-4096.log:step, 6 lanes, 1 row each: wall 19.268 ms, gpu 19.198 ms
+batch-b1-4096.log:step fingerprint=6fff13dc1fbcfebc
+batch-b2-4096.log:step, 6 lanes, 1 row each: wall 19.279 ms, gpu 19.215 ms
+batch-b2-4096.log:step fingerprint=6fff13dc1fbcfebc
