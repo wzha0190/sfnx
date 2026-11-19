@@ -16,10 +16,16 @@ The median fell 0.50–0.61% across the three workloads. The solo and batch
 greedy fingerprints and the forced `code1` logits matched. Retain the
 planner as a candidate for a combined screen; the flag is off in production.
 
-Apply the patch to the deployed source with `git apply --recount --unidiff-zero`.
+For the exact measured source, apply [`cache-all-hit-stack.patch`](cache-all-hit-stack.patch)
+with `git apply` from a clean upstream `980873394a532ca0f187aae034ed4819bb205921`
+checkout. The smaller patch documents this experiment's delta on that
+lab stack; it depends on previously staged opt-in router code. The
+lab controls use the deployed settings, not the byte-identical serving binary.
 Test `FNX_RM400_CACHE_ALL_HIT=0/1/0` in fresh workers on the same model and
 expert profile, `FNX_EXPERT_RAM_GIB=3`, `FNX_BENCH_CTX=4096`.
 Run `bench ref/long64.bin 8 200` and `bench_step ref/long164.bin 6 64 C step`
 for C=4096 and 49152; batch fingerprint export uses the direct-cold-experts
 experiment's tool additions (leave direct reads off). Compare both logit
 files from `logits ref/code1.bin ref/lgr/llama_cuda_code1.lgr 8 OUTPUT.lgr`.
+
+Full lab patch SHA-256: `914acba7e9fae877478568afad0520657dbbcbc7148d71d6e2e0570cb5e6905c`.
