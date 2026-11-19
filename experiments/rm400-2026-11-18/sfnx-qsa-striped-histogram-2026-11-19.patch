@@ -1,0 +1,75 @@
+diff --git a/src/qsa.cuh b/src/qsa.cuh
+--- a/src/qsa.cuh
++++ b/src/qsa.cuh
+@@ -291,2 +291,3 @@
+-__global__ void __launch_bounds__(QSA_SEL_THREADS) k_idx_select(const float* __restrict__ scores, int* __restrict__ cells,
++template <int STRIPES = 1>
++__global__ void __launch_bounds__(QSA_SEL_THREADS) k_idx_select(const float* __restrict__ scores, int* __restrict__ cells,
+@@ -299,10 +300,19 @@
+     const unsigned* key = reinterpret_cast<const unsigned*>(scores + (size_t) t * max_pools);
+-    __shared__ unsigned hist[256];
++    // 2026-11-19: keep the high-byte atomics on separate counters for
++    // different warps. Merging integer counts preserves exact rank/ties.
++    static_assert(STRIPES == 1 || STRIPES == 4);
++    __shared__ unsigned hist[STRIPES][256 + (STRIPES > 1)];
+     __shared__ unsigned prefix_s, want_s;
++    const int stripe = (tid >> 5) & (STRIPES - 1);
++    const auto bin_count = [&](int bin) {
++        unsigned s = 0;
++#pragma unroll
++        for (int i = 0; i < STRIPES; ++i) s += hist[i][bin];
++        return s;
++    };
+     unsigned prefix = 0, mask = 0, want = QSA_TOP;   // find the want-th largest among keys matching prefix on mask
+     for (int shift = 24; shift >= 0; shift -= 8) {
+-        for (int b = tid; b < 256; b += QSA_SEL_THREADS) hist[b] = 0;
++        for (int b = tid; b < STRIPES * 256; b += QSA_SEL_THREADS) hist[b / 256][b % 256] = 0;
+@@ -313,3 +323,3 @@
+             const unsigned peers = __match_any_sync(0xffffffffu, bin);
+-            if (in && (tid & 31) == __ffs(peers) - 1) atomicAdd(&hist[bin], (unsigned) __popc(peers));
++            if (in && (tid & 31) == __ffs(peers) - 1) atomicAdd(&hist[stripe][bin], (unsigned) __popc(peers));
+         }
+@@ -320,3 +330,3 @@
+ #pragma unroll
+-            for (int i = 0; i < 8; ++i) own += hist[hi - i];
++            for (int i = 0; i < 8; ++i) own += bin_count(hi - i);
+             unsigned before = own;   // inclusive scan over the lanes (higher bins first), then exclusive
+@@ -333,8 +343,9 @@
+                 for (int i = 0; i < 8; ++i) {
+                     const int bb = hi - i;
+-                    if (bb == 0 || acc + hist[bb] >= want) {
++                    const unsigned count = bin_count(bb);
++                    if (bb == 0 || acc + count >= want) {
+                         b = bb;
+                         break;
+                     }
+-                    acc += hist[bb];
++                    acc += count;
+                 }
+diff --git a/src/kernels.cu b/src/kernels.cu
+--- a/src/kernels.cu
++++ b/src/kernels.cu
+@@ -1197,2 +1197,2 @@
+-    k_idx_select<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, pos0, card, LaneRows{});
++    k_idx_select<><<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, pos0, card, LaneRows{});
+     ck_launch("qsa_select");
+@@ -1213,2 +1213,8 @@
+-    k_idx_select<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, nullptr, card, lr);
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++    static const bool striped = env_flag("FNX_RM400_QSA_STRIPED_HIST");
++    if (striped)
++        k_idx_select<4><<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, nullptr, card, lr);
++    else
++#endif
++        k_idx_select<><<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, nullptr, card, lr);
+     ck_launch("qsa_select_lanes");
+@@ -1269,2 +1275,8 @@
+-    k_idx_select<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, pos0, card, LaneRows{});
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++    static const bool striped = env_flag("FNX_RM400_QSA_STRIPED_HIST");
++    if (striped)
++        k_idx_select<4><<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, pos0, card, LaneRows{});
++    else
++#endif
++        k_idx_select<><<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, pos0, card, LaneRows{});
+     ck_launch("qsa");

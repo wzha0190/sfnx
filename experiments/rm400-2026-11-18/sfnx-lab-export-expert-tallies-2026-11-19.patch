@@ -1,0 +1,20 @@
+diff --git a/tools/fnx_run.cpp b/tools/fnx_run.cpp
+--- a/tools/fnx_run.cpp
++++ b/tools/fnx_run.cpp
+@@ -1297,3 +1297,16 @@
+             if (fingerprint) std::printf("step fingerprint=%016llx\n", (unsigned long long) hash);
+         }
++        // 2026-11-19: use the upstream decode/prompt tally format on
++        // synthetic lab inputs. No server request data is needed.
++        if (const char* path = std::getenv("FNX_ROUTE_FILE")) {
++            const auto tally = e.route_counts();
++            if (tally.size() != (size_t) 2 * fnx::NL * fnx::NEXP)
++                throw std::runtime_error("bench_step route tallies: enable FNX_ROUTE_COUNT=1");
++            std::FILE* f = std::fopen(path, "wbx");
++            if (!f) throw std::runtime_error("bench_step: cannot create route tally file");
++            const size_t written = std::fwrite(tally.data(), sizeof(unsigned), tally.size(), f);
++            const int close_rc = std::fclose(f);
++            if (written != tally.size() || close_rc)
++                throw std::runtime_error("bench_step: incomplete route tally file");
++        }
+     } else if (mode == "bench") {

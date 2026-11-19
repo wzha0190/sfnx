@@ -1,0 +1,21 @@
+diff --git a/src/kernels.cu b/src/kernels.cu
+--- a/src/kernels.cu
++++ b/src/kernels.cu
+@@ -1759,4 +1759,15 @@
+     if (jobs) k_cache_plan<<<1, 32, 0, (cudaStream_t) st>>>(jobs, njobs, layer, ec, list);
+-    k_cache_copy<<<160, 256, 0, (cudaStream_t) st>>>(ec, p, list, gu_stride, dn_stride);
++    // 2026-11-19: only the decode grid. Try one, two or four CTAs per
++    // V100 SM against the same byte-copy loop and route plan.
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++    static const int blocks = [] {
++        const auto n = env_int("FNX_RM400_EXPERT_COPY_GRID", 160);
++        if (n != 80 && n != 160 && n != 320)
++            throw std::runtime_error("FNX_RM400_EXPERT_COPY_GRID: expected 80, 160 or 320");
++        return (int) n;
++    }();
++#else
++    constexpr int blocks = 160;
++#endif
++    k_cache_copy<<<blocks, 256, 0, (cudaStream_t) st>>>(ec, p, list, gu_stride, dn_stride);
+     ck_launch("moe_cache");
+ }
