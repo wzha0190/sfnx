@@ -1,0 +1,35 @@
+diff --git a/src/moe_q4k.cuh b/src/moe_q4k.cuh
+--- a/src/moe_q4k.cuh
++++ b/src/moe_q4k.cuh
+@@ -131,2 +131,2 @@
+-template <int TT, bool TWIN = false, bool PRODUCER_SUMS = false, bool SHORT_GROUPS = false>
++template <int TT, bool TWIN = false, bool PRODUCER_SUMS = false, bool SHORT_GROUPS = false, bool SINGLE_JOB = false>
+ __global__ void __launch_bounds__(Q4K_THREADS) k_moe_gu_q4k(MoeW w, const Job* __restrict__ jobs, const int* __restrict__ njobs,
+@@ -162,3 +162,14 @@
+     const int row = blockIdx.x * Q4K_ROWS + threadIdx.x / Q4K_LPR, lane8 = threadIdx.x % Q4K_LPR;
+     const bool live = row < w.nrows;
++    if constexpr (SINGLE_JOB) {
++        // 2026-11-19: no per-token loop, output loop, or TT accumulators
++        // on single-token expert jobs. The branch is uniform across the CTA.
++        static_assert(SHORT_GROUPS && !TWIN && !PRODUCER_SUMS);
++        if (jb.n == 1) {
++            float acc = 0.f;
++            if (live) q4k_row<1, true, false, false, true>(
++                moe_expert(w, jb.w) + (size_t) row * w.row_a, lane8, 1, y, jb.y, YB, &acc, sums);
++            job_store<Q4K_LPR, 1>(&acc, 1, live, row, jb.out, out, w.nrows);
++            return;
++        }
++    }
+     float tmp[TT] = {};
+@@ -215,5 +226,13 @@
+                 static const bool short_groups = env_flag("FNX_RM400_Q4K_SHORT_GROUPS");
+                 if (short_groups) {
++                    static const bool single_job = env_flag("FNX_RM400_Q4K_SINGLE_JOB");
++                    if (single_job) {
++                        k_moe_gu_q4k<TT, false, false, true, true><<<grid, Q4K_THREADS, 0, s>>>(
++                            w, jobs, njobs, y, out, sd, sd_rows, nullptr, nullptr, nullptr);
++                        return;
++                    }
+                     k_moe_gu_q4k<TT, false, false, true><<<grid, Q4K_THREADS, 0, s>>>(
+                         w, jobs, njobs, y, out, sd, sd_rows, nullptr, nullptr, nullptr);
+                     return;

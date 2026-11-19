@@ -1,0 +1,70 @@
+diff --git a/src/hc.cuh b/src/hc.cuh
+--- a/src/hc.cuh
++++ b/src/hc.cuh
+@@ -124,2 +124,32 @@
+-template <int T, bool ONE, bool WALK>
++__device__ __forceinline__ void hc_store_q8(const HcArgs& a, int b, int k, int lane, float xi) {
++    const float amax = wmax(fabsf(xi)), sm = wsum(xi);
++    const float dq = amax / 127.0f;
++    block_q8_1& yq = a.q8[(size_t) k * (N / 32) + b];
++    const int8_t qv = amax == 0.0f ? 0 : (int8_t) roundf(xi / dq);
++    yq.qs[lane] = qv;
++    if (lane == 0) yq.ds = make_half2(__float2half(dq), __float2half(sm));
++    if (a.q4k_sums) {
++        int sum = qv;
++#pragma unroll
++        for (int bit = 16; bit; bit >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, bit);
++        if (lane == 0) a.q4k_sums[(size_t) k * (N / 32) + b] = static_cast<int16_t>(sum);
++    }
++    if (a.tq) {
++        a.tq[(size_t) k * N + b * 32 + lane] = qv;
++        if (lane == 0) a.td[(size_t) k * (N / 32) + b] = __half2float(__float2half(dq));
++    }
++}
++
++template <int T, bool ONE, bool WALK, bool WARP_OUT = false>
+ __global__ void __launch_bounds__(H_DT, 1) k_hc(HcArgs a) {
+@@ -359,3 +379,23 @@
+     __syncthreads();
+-    // item (k, c, col): this block's 32 columns of stream c, row k, coalesced along the columns
+     const int b = vb;
++    if constexpr (WARP_OUT) {
++        // 2026-11-19: each warp owns one output row, so it can move through
++        // mixing and quantization without exchanging data with other warps.
++        static_assert(H_UPC == 32 && HC == 4 && T <= H_DT / 32);
++        if (warp < T) {
++            const int k = warp, dc = b * H_UPC + lane;
++            float g[HC];
++#pragma unroll
++            for (int cc = 0; cc < HC; ++cc) {
++                const float rv = rprime(a, k, cc, dc);
++                if (a.bo) a.R[(size_t) k * D + cc * N + dc] = rv;
++                g[cc] = sigm(gs[k][cc][lane]) * (rv * a.w_norm[cc * N + dc] * rs[k][cc]);
++            }
++            const float sum = (g[0] + g[1] + g[2] + g[3]) / (float) HC;
++            a.mixed[(size_t) k * N + dc] = sum;
++            if (a.q8) hc_store_q8(a, b, k, lane, sum);
++        }
++        continue;
++    }
++    // item (k, c, col): this block's 32 columns of stream c, row k, coalesced along the columns
+@@ -402,2 +442,17 @@
+ template <int T> void hc_launch(const HcArgs& a, cudaStream_t st, bool one, int grid) {
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++    static const bool warp_out = env_flag("FNX_RM400_HC_WARP_OUT");
++    // Narrow windows keep the upstream path: fewer warps may not hide the
++    // added per-warp work. WALK is excluded from this first screening run.
++    if constexpr (T >= 4 && T <= H_DT / 32) {
++        if (warp_out && grid == H_BLOCKS) {
++            if constexpr (T <= 8) {
++                if (one) {
++                    k_hc<T, true, false, true><<<grid, H_DT, 0, st>>>(a);
++                    return;
++                }
++            }
++            k_hc<T, false, false, true><<<grid, H_DT, 0, st>>>(a);
++            return;
++        }
++    }
++#endif
+     if constexpr (T <= 8) {
