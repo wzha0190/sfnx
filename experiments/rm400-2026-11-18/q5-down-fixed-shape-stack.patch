@@ -1,0 +1,2518 @@
+diff --git a/src/dense.cuh b/src/dense.cuh
+index fcb79b9..2272ace 100644
+--- a/src/dense.cuh
++++ b/src/dense.cuh
+@@ -21,10 +21,10 @@ template <typename F> __device__ __forceinline__ F q8s_pick(int s, F a, F b, F c
+ // SEG: the rows' segments looked up (q8s_gemv_segs); else one matrix, g's first segment, its row pointers made in the
+ // loops as before (held per row in registers they cost the 16-row path ~30-80%)
+ // block bx of the launch (a kernel of its own, or part of a launch shared with other work: k_q8s_ab)
+-template <int T, int Q8S_R, bool SPLIT, bool SEG>
++template <int T, int Q8S_R, bool SPLIT, bool SEG, int TOKEN_TILE = 0, int THREADS = Q8S_THREADS>
+ __device__ __forceinline__ void q8s_block(const Q8Segs& g, int rows, int cols, const block_q8_1* __restrict__ y,
+                                           const int8_t* __restrict__ tq, const float* __restrict__ td, int bx) {
+-    constexpr int Q8S_ROWS = Q8S_THREADS / 32 * Q8S_R;
++    constexpr int Q8S_ROWS = THREADS / 32 * Q8S_R;
+     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+     const int row0 = bx * Q8S_ROWS + warp * Q8S_R, nb = cols / 32;
+     // each of the warp's rows: its segment's weights at the row's place in it
+@@ -45,12 +45,14 @@ __device__ __forceinline__ void q8s_block(const Q8Segs& g, int rows, int cols, c
+     for (int r = 0; r < Q8S_R; ++r)
+ #pragma unroll
+         for (int t = 0; t < T; ++t) acc[r][t] = 0.f;
+-    if constexpr ((T > 8 && Q8S_R >= 2) || (Q8S_R >= 4 && T > 4)) {
++    if constexpr (TOKEN_TILE || (T > 8 && Q8S_R >= 2) || (Q8S_R >= 4 && T > 4)) {
+         // the step's weights for the warp's rows held, the activations TC rows at a time against them: all T rows'
+         // held took up to ~160 registers (16 rows, 4 a warp: one block an SM, 12% occupancy). kbench, 16 rows: the
+         // head 722 -> 495 us, qkvz 60 -> 48; at 5-8 rows it pays only with 4 rows a warp, and not at all with 1. Each
+         // sum takes the same steps in the same order
+-        constexpr int TC = 4;
++        // 2026-11-19: retain fewer activation rows in registers, without
++        // changing each lane's column accumulation or its final warp sum.
++        constexpr int TC = TOKEN_TILE ? TOKEN_TILE : 4;
+ #pragma unroll 1
+         for (int c = lane * 16; c < cols; c += 512) {
+             const int b = c >> 5, half = (c >> 4) & 1;
+@@ -153,10 +155,10 @@ __device__ __forceinline__ void q8s_block(const Q8Segs& g, int rows, int cols, c
+         }
+ }
+ 
+-template <int T, int Q8S_R, bool SPLIT, bool SEG>
++template <int T, int Q8S_R, bool SPLIT, bool SEG, int TOKEN_TILE = 0>
+ __global__ void __launch_bounds__(Q8S_THREADS) k_q8s(const Q8Segs g, int rows, int cols, const block_q8_1* __restrict__ y,
+                                                     const int8_t* __restrict__ tq, const float* __restrict__ td) {
+-    q8s_block<T, Q8S_R, SPLIT, SEG>(g, rows, cols, y, tq, td, blockIdx.x);
++    q8s_block<T, Q8S_R, SPLIT, SEG, TOKEN_TILE>(g, rows, cols, y, tq, td, blockIdx.x);
+ }
+ 
+ // The shared expert inside the routed experts' launches (no second stream): its gate|up as extra blocks of the router's
+@@ -180,7 +182,7 @@ template <int T> __device__ __forceinline__ void shexp_up_block(const ShexpUp& s
+ }
+ // this block's share (q8s blocks bx0, bx0 + nbx, ...) of the down rows, after the swiglu made in shared memory as
+ // k_swiglu_stacked makes its split twin
+-template <int T> __device__ void shexp_down_blocks(const ShexpDown& s, int bx0, int nbx) {
++template <int T, int THREADS = Q8S_THREADS> __device__ void shexp_down_blocks(const ShexpDown& s, int bx0, int nbx) {
+     __shared__ __align__(16) int8_t tq[T * SH_MAXF];
+     __shared__ float td[T * (SH_MAXF / 32)];
+     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nb = s.ffs / 32;
+@@ -193,8 +195,8 @@ template <int T> __device__ void shexp_down_blocks(const ShexpDown& s, int bx0,
+         if (lane == 0) td[t * nb + b] = __half2float(__float2half(d));
+     }
+     __syncthreads();
+-    const int nqb = (s.rows + Q8S_THREADS / 32 - 1) / (Q8S_THREADS / 32);
+-    for (int bx = bx0; bx < nqb; bx += nbx) q8s_block<T, 1, true, false>(s.w, s.rows, s.ffs, nullptr, tq, td, bx);
++    const int nqb = (s.rows + THREADS / 32 - 1) / (THREADS / 32);
++    for (int bx = bx0; bx < nqb; bx += nbx) q8s_block<T, 1, true, false, 0, THREADS>(s.w, s.rows, s.ffs, nullptr, tq, td, bx);
+ }
+ 
+ }  // namespace
+diff --git a/src/engine.cu b/src/engine.cu
+index 1877368..42f6aef 100644
+--- a/src/engine.cu
++++ b/src/engine.cu
+@@ -79,6 +79,8 @@ __global__ void ngram_wait_copy_k(const volatile unsigned* flag, const int* ctl,
+ }  // namespace
+ 
+ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
++    compact_snapshots_ = env_flag("FNX_RM400_COMPACT_SNAPSHOTS");
++    mtp_last_row_only_ = env_flag("FNX_RM400_MTP_LAST_ROW");
+     // the 27B build's settings: this Flash-Next engine has none of what they set, so one given is a mistake, not a
+     // run of the default
+     for (const char* k : {"FNX_PF_SKIP", "FNX_PF_SKIP_CONFIRM", "FNX_PF_SCORE_MIB", "FNX_PF_WINDOWS", "FNX_PF_SCORES",
+@@ -199,6 +201,10 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
+         b->part = dalloc<float>((size_t) (P + MAXT) * N);
+         b->sh_gu = dalloc<float>((size_t) MAXT * 2 * ffs);
+         b->sh_hq = dalloc<uint8_t>((size_t) MAXT * q8_1_bytes(ffs));
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++        if (env_flag("FNX_RM400_PRODUCER_SUMS"))
++            b->q4k_sums = dalloc<int16_t>((size_t) MAXT * (N / 32));
++#endif
+         if (!std::getenv("FNX_NO_TWIN")) {
+             // the split twins: xq's rows of n <= N columns sit at r q8_1_bytes(n), so r n < P N
+             q8_twin(b->xq, (size_t) P * q8_1_bytes(N), dalloc<int8_t>((size_t) P * N), dalloc<float>((size_t) P * N / 32));
+@@ -902,15 +908,35 @@ void Engine::dense(const DW& W, const void* y, float* out, CardBuf& b, int T) {
+     else mmvq(W, 0, b.dense[T], nullptr, 1, y, out, W.n_out, b.st);
+ }
+ 
+-// an attention layer's mixer after its hc read (mixed in b.xq): q/k/v, the window's K/V into kc/vc at ctl[0], the
+-// attention, the output projection into b.bo_a
+-void Engine::attention(int T, CardBuf& b, const CardW& w, const LayerW& L, uint16_t* kc, uint16_t* vc, const int* ctl,
+-                       uint16_t* qsa_ring, uint16_t* qsa_pooled, int call) {
+-    // the indexer first (it reads mixed / its q8 copy, which the projections below leave as they are)
+-    if (!L.idx_wq) dense(L.idx_qk, b.xq, b.qsa_y, b, T);
+-    qsa(L.idx_wq, L.idx_wk, b.mixed, b.qsa_y, L.idx_qn, L.idx_kn, qsa_ring, qsa_pooled, b.pg, b.qsa_q, b.qsa_scores, b.qsa_cells,
+-        b.qsa_ncells, max_ctx_ / 4, ctl, T, m_.eps, rope_of(b.mrope), b.att_ring.card, b.st);
+-    if (L.wq.s.q && L.wk.s.q && L.wv.s.q && L.wq.n_in == L.wk.n_in && L.wq.n_in == L.wv.n_in &&
++// 2026-11-18: batched windows can use the single-window projection
++// kernels too; all of these projections are independent by input row.
++static bool batch_fused_projections() {
++    static const bool fused = env_int("FNX_RM400_BATCH_FUSED", 0) != 0;
++    return fused;
++}
++
++// 2026-11-19: fuse attention preparation across lanes without
++// changing each lane's positions, page table or rotary input.
++static int batch_attention_prep() {
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++    static const int mode = [] {
++        const auto n = env_int("FNX_RM400_BATCH_ATTN_PREP", 0);
++        if (n < 0 || n > 3) throw std::runtime_error("FNX_RM400_BATCH_ATTN_PREP: expected 0..3");
++        return (int) n;
++    }();
++    return mode;
++#else
++    return 0;
++#endif
++}
++bool Engine::gdn_project_fused(int T, int nv, CardBuf& b, const LayerW& L) {
++    if (!L.qkvz.s.q || 2 * nv > 160 || L.qkvz.n_out < 4096 || L.qkvz.n_out >= 8192) return false;
++    q8s_gemv_f32(L.qkvz.s, L.qkvz.n_out, L.qkvz.n_in, b.xq, b.qkvz, L.ab, b.mixed, b.ab, 2 * nv, T, b.st);
++    return true;
++}
++
++void Engine::attn_project(int T, CardBuf& b, const LayerW& L, bool fuse) {
++    if (fuse && L.wq.s.q && L.wk.s.q && L.wv.s.q && L.wq.n_in == L.wk.n_in && L.wq.n_in == L.wv.n_in &&
+         L.wq.n_out + L.wk.n_out + L.wv.n_out >= 8192) {   // q, k and v in one launch (compiled for 8192 rows and more)
+         const Q8S ws[3] = {L.wq.s, L.wk.s, L.wv.s};
+         const int rows[3] = {L.wq.n_out, L.wk.n_out, L.wv.n_out};
+@@ -921,6 +947,17 @@ void Engine::attention(int T, CardBuf& b, const CardW& w, const LayerW& L, uint1
+         dense(L.wk, b.xq, b.k, b, T);
+         dense(L.wv, b.xq, b.v, b, T);
+     }
++}
++
++// an attention layer's mixer after its hc read (mixed in b.xq): q/k/v, the window's K/V into kc/vc at ctl[0], the
++// attention, the output projection into b.bo_a
++void Engine::attention(int T, CardBuf& b, const CardW& w, const LayerW& L, uint16_t* kc, uint16_t* vc, const int* ctl,
++                       uint16_t* qsa_ring, uint16_t* qsa_pooled, int call) {
++    // the indexer first (it reads mixed / its q8 copy, which the projections below leave as they are)
++    if (!L.idx_wq) dense(L.idx_qk, b.xq, b.qsa_y, b, T);
++    qsa(L.idx_wq, L.idx_wk, b.mixed, b.qsa_y, L.idx_qn, L.idx_kn, qsa_ring, qsa_pooled, b.pg, b.qsa_q, b.qsa_scores, b.qsa_cells,
++        b.qsa_ncells, max_ctx_ / 4, ctl, T, m_.eps, rope_of(b.mrope), b.att_ring.card, b.st);
++    attn_project(T, b, L, true);
+     attn_prep_append(b.qg, b.k, b.v, L.q_norm, L.k_norm, kc, vc, b.pg, b.att_ring.card, T, ctl, m_.eps, rope_of(b.mrope), b.st);
+     attn(b.qg, kc, vc, b.pg, b.att, b.att_ring, (const unsigned*) (ctl + 1), call, ctl, T, b.att_part, b.st, b.qsa_cells, b.qsa_ncells);
+     quantize_q8_1(b.att, b.xq, w.nq * HD, T, b.st);
+@@ -932,25 +969,52 @@ void Engine::attention(int T, CardBuf& b, const CardW& w, const LayerW& L, uint1
+ // experts, the weighted sum across the cards into b.bo_f
+ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW& L, float* R, const int* ctl) {
+     const int P = T * TOPK, ffs = w.ff1 - w.ff0;
+-    hc_read(R, b.bo_a, b.inj_a, L.hc_norm[1], L.hc_down[1], L.hc_up[1], L.hc_inj[1], m_.eps, b.mixed, b.inj_f, b.hcs, b.ring.err, T, b.st, b.xq);
++    int16_t* const q4k_sums = L.gu_e.type == T_Q4_K ? b.q4k_sums : nullptr;
++    hc_read(R, b.bo_a, b.inj_a, L.hc_norm[1], L.hc_down[1], L.hc_up[1], L.hc_inj[1], m_.eps, b.mixed, b.inj_f, b.hcs, b.ring.err,
++            T, b.st, b.xq, q4k_sums);
+     // the shared expert (rows P + t of part): its gate|up in the router's launch and its swiglu and down in the routed
+     // gate|up's (Q4_K experts), else on the second stream (a fork and a join cost ~5 us more than the launches' blocks)
+-    const bool sh_in = L.gu_e.type == T_Q4_K && L.sh_gu.s.q && L.sh_down.s.q && ffs % 32 == 0 && ffs <= SH_MAXF;
+-    if (!sh_in) {
++    const bool can_fuse = L.gu_e.type == T_Q4_K && L.sh_gu.s.q && L.sh_down.s.q && ffs % 32 == 0 && ffs <= SH_MAXF;
++    // 2026-11-19: reuse the existing second-stream path to quantize
++    // shared SwiGLU once (1) or move the entire shared expert (2).
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++    static const int shared_layout = [] {
++        const auto n = env_int("FNX_RM400_SHARED_EXPERT_LAYOUT", 0);
++        if (n < 0 || n > 2) throw std::runtime_error("FNX_RM400_SHARED_EXPERT_LAYOUT: expected 0..2");
++        return (int) n;
++    }();
++#else
++    constexpr int shared_layout = 0;
++#endif
++    const int layout = (T >= 4 && T <= 8) ? shared_layout : 0;
++    const bool fused_up = can_fuse && layout != 2;
++    const bool fused_down = can_fuse && layout == 0;
++    const auto shared_side = [&](bool run_up) {
+         ck(cudaEventRecord(b.fork, b.st), "fork");
+         ck(cudaStreamWaitEvent(b.st2, b.fork, 0), "fork wait");
+-        q8s_gemv(L.sh_gu.s, 2 * ffs, N, b.xq, b.sh_gu, 2 * ffs, T, b.st2);
++        if (run_up) q8s_gemv(L.sh_gu.s, 2 * ffs, N, b.xq, b.sh_gu, 2 * ffs, T, b.st2);
+         swiglu_stacked_q8_1(b.sh_gu, b.sh_hq, ffs, T, b.st2);
+         q8s_gemv(L.sh_down.s, N, ffs, b.sh_hq, b.part + (size_t) P * N, N, T, b.st2);
+         ck(cudaEventRecord(b.join, b.st2), "join");
+-    }
++    };
++    if (!fused_up) shared_side(true);
+     const int lyr = (int) (&L - w.L.data());
+     // experts in RAM: the router's last block plans this window's slots (the prefetch probe scores the picks against
+     // the slots as they were, so with it the plan runs after, in moe_cache)
+     const bool live = cache_live() && lyr >= 0 && lyr < NL;
+-    const bool plan_in_router = live && !b.probe_cnt;
++    // 2026-11-19: compare a demand read from the same host-mapped weights
++    // against staging them. The expert pointer tables already identify
++    // resident slots and host copies; leave both untouched in this mode.
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++    static const bool direct = env_flag("FNX_RM400_DIRECT_COLD_EXPERTS");
++#else
++    constexpr bool direct = false;
++#endif
++    const bool stage = live && !direct;
++    const bool plan_in_router = stage && !b.probe_cnt;
+     router_route(L.router, b.mixed, b.logits, T, b.topi, b.topw, b.jobs_gu, b.jobs_dn, b.njobs, b.st, plan_in_router ? &w.ec : nullptr,
+-                 lyr, b.cache_list, sh_in ? &L.sh_gu.s : nullptr, 2 * ffs, b.xq, b.sh_gu);
++                 lyr, b.cache_list, fused_up ? &L.sh_gu.s : nullptr, 2 * ffs, b.xq, b.sh_gu);
++    if (fused_up && !fused_down) shared_side(false);
+     if (const int l = lyr; l >= 0 && l < NL) {
+         if (b.route_cnt) route_count(b.topi, P, b.route_cnt + (size_t) l * NEXP, b.st);
+         if (b.route_trace) fnx::route_trace(b.topi, P, l, b.route_trace, b.route_trace_len, b.route_trace_cap, b.st);
+@@ -964,12 +1028,15 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
+             }
+         }
+         // the planned experts copied into their slots before the MoE kernels read the layer's tables
+-        if (live) moe_cache(l, L.gu_e_stride, L.down_e_stride, w.ec, b.cache_list, b.st, plan_in_router ? nullptr : b.jobs_gu, b.njobs);
++        if (stage) moe_cache(l, L.gu_e_stride, L.down_e_stride, w.ec, b.cache_list, b.st, plan_in_router ? nullptr : b.jobs_gu, b.njobs);
+     }
+-    if (sh_in) moe_gate_up(L.gu_e, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st, &L.sh_down.s, ffs, b.sh_gu, b.part + (size_t) P * N);
+-    else moe_gate_up(L.gu_e, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st);
++    if (fused_down)
++        moe_gate_up(L.gu_e, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st, &L.sh_down.s, ffs, b.sh_gu,
++                    b.part + (size_t) P * N, q4k_sums);
++    else
++        moe_gate_up(L.gu_e, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st, nullptr, 0, nullptr, nullptr, q4k_sums);
+     moe_down(L.down_e, L.down_e_stride, b.jobs_dn, b.njobs, P, b.gu, b.part, b.st);
+-    if (!sh_in) ck(cudaStreamWaitEvent(b.st, b.join, 0), "join wait");
++    if (!fused_down) ck(cudaStreamWaitEvent(b.st, b.join, 0), "join wait");
+     RingMoe m;
+     m.part = b.part;
+     m.topw = b.topw;
+@@ -1015,9 +1082,7 @@ void Engine::enqueue(int T, bool dumps) {
+             if (!is_attn(l)) {
+                 const int nv = w.nv(), ch = w.conv_ch();
+                 // ab beside qkvz in one launch (a fork and a join: ~5 us more; compiled for 4096..8191 rows)
+-                if (L.qkvz.s.q && 2 * nv <= 160 && L.qkvz.n_out >= 4096 && L.qkvz.n_out < 8192) {
+-                    q8s_gemv_f32(L.qkvz.s, L.qkvz.n_out, L.qkvz.n_in, b.xq, b.qkvz, L.ab, b.mixed, b.ab, 2 * nv, T, b.st);
+-                } else {
++                if (!gdn_project_fused(T, nv, b, L)) {
+                     ck(cudaEventRecord(b.fork, b.st), "fork");
+                     ck(cudaStreamWaitEvent(b.st2, b.fork, 0), "fork wait");
+                     gemv_f32(L.ab, b.mixed, b.ab, 2 * nv, N, T, b.st2);
+@@ -1026,7 +1091,7 @@ void Engine::enqueue(int T, bool dumps) {
+                     ck(cudaStreamWaitEvent(b.st, b.join, 0), "join wait");
+                 }
+                 gdn_core(b.qkvz, b.ab, b.chist[l], L.conv, L.dt_bias, L.ssm_a, L.ssm_norm, b.S[l], b.xq, b.ctl, b.gdn_scratch, b.snap[l],
+-                         b.hsnap[l], w.nk, nv, w.vmap, T, eps, b.st);
++                         b.hsnap[l], w.nk, nv, w.vmap, T, eps, b.st, nullptr, bench_first_snapshot_, compact_snapshots_);
+                 dense(L.ssm_out, b.xq, b.bo_a, b, T);
+             } else {
+                 attention(T, b, w, L, b.kc[l], b.vc[l], b.ctl, b.qsa_ring[l], b.qsa_pooled[l], 128 + l);
+@@ -1085,8 +1150,10 @@ void Engine::enqueue_batch(const std::vector<int>& lanes) {
+                     b.inj_a, b.hcs, b.ring.err, T, b.st, b.xq);
+             if (!is_attn(l)) {
+                 const int nv = w.nv();
+-                gemv_f32(L.ab, b.mixed, b.ab, 2 * nv, N, T, b.st);
+-                dense(L.qkvz, b.xq, b.qkvz, b, T);
++                if (!batch_fused_projections() || !gdn_project_fused(T, nv, b, L)) {
++                    gemv_f32(L.ab, b.mixed, b.ab, 2 * nv, N, T, b.st);
++                    dense(L.qkvz, b.xq, b.qkvz, b, T);
++                }
+                 float** rec = b.lane_gdn[(size_t) T];
+                 const GdnLanes gl{rec + (size_t) l * MAXT, rec + (size_t) (NL + l) * MAXT, b.lane_rows[(size_t) T]};
+                 gdn_core_lanes(b.qkvz, b.ab, L.conv, L.dt_bias, L.ssm_a, L.ssm_norm, b.xq, b.gdn_scratch, w.nk, nv, w.vmap, gl, T, eps, b.st);
+@@ -1094,23 +1161,38 @@ void Engine::enqueue_batch(const std::vector<int>& lanes) {
+             } else {
+                 if (!L.idx_wq) dense(L.idx_qk, b.xq, b.qsa_y, b, T);
+                 else qsa_proj(L.idx_wq, L.idx_wk, b.mixed, b.qsa_y, T, b.st);
+-                dense(L.wq, b.xq, b.qg, b, T);
+-                dense(L.wk, b.xq, b.k, b, T);
+-                dense(L.wv, b.xq, b.v, b, T);
++                attn_project(T, b, L, batch_fused_projections());
+                 const int mp = max_ctx_ / 4;
+-                for (int r = 0; r < T; ++r) {
++                const LaneRows lr{b.lane_rows[(size_t) T], b.lane_rows[(size_t) T] + MAXT};
++                const int batch_prep = batch_attention_prep();
++                if (batch_prep) {
++                    LaneAttPrep prep{lr};
++                    for (int r = 0; r < T; ++r) {
++                        const LaneDev& LD = b.lanes[(size_t) lanes[r]];
++                        prep.rot[r] = LD.mrope;
++                        prep.ring[r] = LD.ring[l];
++                        prep.first[r] = (uint8_t) r;
++                    }
++                    if (batch_prep & 1)
++                        qsa_index_lanes(b.qsa_y, L.idx_qn, L.idx_kn, b.qsa_pooled[l], b.pg, b.qsa_q, prep, T, eps, rope_, b.st);
++                    if (batch_prep & 2)
++                        attn_prep_append_lanes(b.qg, b.k, b.v, L.q_norm, L.k_norm, b.kc[l], b.vc[l], b.pg,
++                                               prep, b.att_ring.card, T, eps, rope_, b.st);
++                }
++                if (batch_prep != 3) for (int r = 0; r < T; ++r) {
+                     const LaneDev& LD = b.lanes[(size_t) lanes[r]];
+-                    KvPages pg = b.pg;   // the card's page size and rows, the lane's table
++                    KvPages pg = b.pg;
+                     pg.pt = LD.pt;
+-                    qsa_index(b.qsa_y + (size_t) r * qsa_rows(), L.idx_qn, L.idx_kn, LD.ring[l], b.qsa_pooled[l], pg, b.qsa_q + (size_t) r * 512,
+-                              LD.ctl, 1, eps, rope_of(LD.mrope), b.st);
+-                    attn_prep(b.qg + (size_t) r * NQH * 2 * HD, b.k + (size_t) r * NKVH * HD, L.q_norm, L.k_norm, NQH, NKVH, LD.ctl, 1, eps,
+-                              rope_of(LD.mrope), b.st);
+-                    kv_append(b.k + (size_t) r * NKVH * HD, b.v + (size_t) r * NKVH * HD, b.kc[l], b.vc[l], pg, b.att_ring.card, 1, LD.ctl,
+-                              b.st);
++                    if (!(batch_prep & 1))
++                        qsa_index(b.qsa_y + (size_t) r * qsa_rows(), L.idx_qn, L.idx_kn, LD.ring[l], b.qsa_pooled[l], pg,
++                                  b.qsa_q + (size_t) r * 512, LD.ctl, 1, eps, rope_of(LD.mrope), b.st);
++                    if (!(batch_prep & 2)) {
++                        attn_prep(b.qg + (size_t) r * NQH * 2 * HD, b.k + (size_t) r * NKVH * HD, L.q_norm, L.k_norm, NQH, NKVH,
++                                  LD.ctl, 1, eps, rope_of(LD.mrope), b.st);
++                        kv_append(b.k + (size_t) r * NKVH * HD, b.v + (size_t) r * NKVH * HD, b.kc[l], b.vc[l], pg,
++                                  b.att_ring.card, 1, LD.ctl, b.st);
++                    }
+                 }
+-                // every row's selection and attention partials at once, each on its lane's position and pages
+-                const LaneRows lr{b.lane_rows[(size_t) T], b.lane_rows[(size_t) T] + MAXT};
+                 qsa_select_lanes(b.qsa_q, b.qsa_pooled[l], b.pg, b.qsa_scores, b.qsa_cells, b.qsa_ncells, mp, lr, T, b.att_ring.card, b.st);
+                 attn_part_lanes(b.qg, b.kc[l], b.vc[l], b.pg, lr, T, b.att_part, b.st, b.qsa_cells, b.qsa_ncells, b.att_ring.card);
+                 attn_finish(b.qg, b.att, b.att_ring, (const unsigned*) (b.ctl + 1), 128 + l, T, b.att_part, b.st);
+@@ -1166,12 +1248,14 @@ void Engine::enqueue_rows(const std::vector<int>& lanes, const std::vector<int>&
+                     b.inj_a, b.hcs, b.ring.err, T, b.st, b.xq);
+             if (!is_attn(l)) {
+                 const int nv = w.nv();
+-                gemv_f32(L.ab, b.mixed, b.ab, 2 * nv, N, T, b.st);
+-                dense(L.qkvz, b.xq, b.qkvz, b, T);
++                if (!batch_fused_projections() || !gdn_project_fused(T, nv, b, L)) {
++                    gemv_f32(L.ab, b.mixed, b.ab, 2 * nv, N, T, b.st);
++                    dense(L.qkvz, b.xq, b.qkvz, b, T);
++                }
+                 float** rec = b.lane_gdn[(size_t) T];
+                 for (const RowGroup& g : sg.groups) {
+                     const GdnLanes gl{rec + (size_t) l * MAXT + g.s0, rec + (size_t) (NL + l) * MAXT + g.s0, b.seg_ctl[(size_t) T] + g.s0,
+-                                      b.seg_row0[(size_t) T] + g.s0, b.snap[l], b.hsnap[l]};
++                                      b.seg_row0[(size_t) T] + g.s0, b.snap[l], b.hsnap[l], false, compact_snapshots_};
+                     gdn_core_segs(b.qkvz, b.ab, L.conv, L.dt_bias, L.ssm_a, L.ssm_norm, b.xq, b.gdn_scratch, w.nk, nv, w.vmap, gl, g.n,
+                                   g.count, eps, b.st);
+                 }
+@@ -1179,23 +1263,40 @@ void Engine::enqueue_rows(const std::vector<int>& lanes, const std::vector<int>&
+             } else {
+                 if (!L.idx_wq) dense(L.idx_qk, b.xq, b.qsa_y, b, T);
+                 else qsa_proj(L.idx_wq, L.idx_wk, b.mixed, b.qsa_y, T, b.st);
+-                dense(L.wq, b.xq, b.qg, b, T);
+-                dense(L.wk, b.xq, b.k, b, T);
+-                dense(L.wv, b.xq, b.v, b, T);
++                attn_project(T, b, L, batch_fused_projections());
+                 const int mp = max_ctx_ / 4;
+-                for (int i = 0; i < nl; ++i) {
++                const LaneRows lr{b.lane_rows[(size_t) T], b.lane_rows[(size_t) T] + MAXT};
++                const int batch_prep = batch_attention_prep();
++                if (batch_prep) {
++                    LaneAttPrep prep{lr};
++                    for (int r = 0; r < T; ++r) {
++                        const int i = sg.row_lane[(size_t) r];
++                        const LaneDev& LD = b.lanes[(size_t) lanes[i]];
++                        prep.rot[r] = LD.mrope;
++                        prep.ring[r] = LD.ring[l];
++                        prep.first[r] = (uint8_t) sg.r0[(size_t) i];
++                    }
++                    if (batch_prep & 1)
++                        qsa_index_lanes(b.qsa_y, L.idx_qn, L.idx_kn, b.qsa_pooled[l], b.pg, b.qsa_q, prep, T, eps, rope_, b.st);
++                    if (batch_prep & 2)
++                        attn_prep_append_lanes(b.qg, b.k, b.v, L.q_norm, L.k_norm, b.kc[l], b.vc[l], b.pg,
++                                               prep, b.att_ring.card, T, eps, rope_, b.st);
++                }
++                if (batch_prep != 3) for (int i = 0; i < nl; ++i) {
+                     const LaneDev& LD = b.lanes[(size_t) lanes[i]];
+                     KvPages pg = b.pg;   // the card's page size and rows, the lane's table
+                     pg.pt = LD.pt;
+                     const size_t r = (size_t) sg.r0[(size_t) i];
+                     const int k = counts[(size_t) i];
+-                    qsa_index(b.qsa_y + r * qsa_rows(), L.idx_qn, L.idx_kn, LD.ring[l], b.qsa_pooled[l], pg, b.qsa_q + r * 512, LD.ctl, k, eps,
+-                              rope_of(LD.mrope), b.st);
+-                    attn_prep(b.qg + r * NQH * 2 * HD, b.k + r * NKVH * HD, L.q_norm, L.k_norm, NQH, NKVH, LD.ctl, k, eps,
+-                              rope_of(LD.mrope), b.st);
+-                    kv_append(b.k + r * NKVH * HD, b.v + r * NKVH * HD, b.kc[l], b.vc[l], pg, b.att_ring.card, k, LD.ctl, b.st);
++                    if (!(batch_prep & 1))
++                        qsa_index(b.qsa_y + r * qsa_rows(), L.idx_qn, L.idx_kn, LD.ring[l], b.qsa_pooled[l], pg, b.qsa_q + r * 512, LD.ctl, k,
++                                  eps, rope_of(LD.mrope), b.st);
++                    if (!(batch_prep & 2)) {
++                        attn_prep(b.qg + r * NQH * 2 * HD, b.k + r * NKVH * HD, L.q_norm, L.k_norm, NQH, NKVH, LD.ctl, k, eps,
++                                  rope_of(LD.mrope), b.st);
++                        kv_append(b.k + r * NKVH * HD, b.v + r * NKVH * HD, b.kc[l], b.vc[l], pg, b.att_ring.card, k, LD.ctl, b.st);
++                    }
+                 }
+-                const LaneRows lr{b.lane_rows[(size_t) T], b.lane_rows[(size_t) T] + MAXT};
+                 qsa_select_lanes(b.qsa_q, b.qsa_pooled[l], b.pg, b.qsa_scores, b.qsa_cells, b.qsa_ncells, mp, lr, T, b.att_ring.card, b.st);
+                 attn_part_lanes(b.qg, b.kc[l], b.vc[l], b.pg, lr, T, b.att_part, b.st, b.qsa_cells, b.qsa_ncells, b.att_ring.card);
+                 attn_finish(b.qg, b.att, b.att_ring, (const unsigned*) (b.ctl + 1), 128 + l, T, b.att_part, b.st);
+@@ -1304,9 +1405,14 @@ void Engine::mtp_enqueue(int T) {
+         const MtpCard& mc = mtp_->cards[c];
+         ck(cudaSetDevice(b.dev), "set");
+         hc_read(b.mtp_R, b.bo_f, b.inj_f, mc.mix_norm, mc.mix_down, mc.mix_up, nullptr, eps, b.mixed, b.inj_a, b.hcs, b.ring.err, T, b.st, b.xq);
+-        dense(mc.head, b.xq, b.mtp_logits, b, T);
+-        penalize_row(b.mtp_logits + (size_t) (T - 1) * (mc.dv1 - mc.dv0), mc.dv1 - mc.dv0, b.mtp_pen, b.mtp_pen_par, b.st);
+-        argmax(b.mtp_logits, mc.dv1 - mc.dv0, T, mc.dv0, b.mtp_bv, b.mtp_bi, b.am_keys, b.ring.err, b.st);
++        // 2026-11-18: only the last row is consumed; preserve the earlier
++        // layer's K/V writes, but avoid projecting their logits.
++        const int rows = mtp_last_row_only_ ? 1 : T;
++        const void* act = b.xq;
++        if (mtp_last_row_only_) act = (const uint8_t*) b.xq + (size_t) (T - 1) * q8_1_bytes(N);
++        dense(mc.head, act, b.mtp_logits, b, rows);
++        penalize_row(b.mtp_logits + (size_t) (rows - 1) * (mc.dv1 - mc.dv0), mc.dv1 - mc.dv0, b.mtp_pen, b.mtp_pen_par, b.st);
++        argmax(b.mtp_logits, mc.dv1 - mc.dv0, rows, mc.dv0, b.mtp_bv, b.mtp_bi, b.am_keys, b.ring.err, b.st);
+     }
+ }
+ 
+diff --git a/src/engine.hpp b/src/engine.hpp
+index 35c0502..54225cc 100644
+--- a/src/engine.hpp
++++ b/src/engine.hpp
+@@ -151,6 +151,10 @@ public:
+     std::vector<std::vector<int>> held_layouts(const std::vector<int>& lanes) const;
+     const std::vector<int>& lane_history(int i) const { return i == cur_ ? history_ : lanes_[(size_t) i].history; }
+     int pos() const { return pos_; }
++    // fnx_run bench alone commits exactly one row. Keep row 0's rollback
++    // snapshot but skip all later snapshots to price compact rollback.
++    void bench_first_snapshot() { bench_first_snapshot_ = true; }
++
+     int max_ctx() const { return max_ctx_; }
+     const std::vector<int>& history() const { return history_; }   // the tokens at positions 0 .. pos() - 1
+     // back to an empty sequence: the recurrent states and histories zeroed (K/V, QSA keys and the draft layer's cells
+@@ -189,6 +193,9 @@ public:
+ private:
+     Model& m_;
+     int max_ctx_, pos_ = 0;
++    bool bench_first_snapshot_ = false;
++    bool compact_snapshots_ = false;
++    bool mtp_last_row_only_ = false;
+     // the rotary's constants, YaRN's included when scaled, set at construction (before any graph capture: they ride
+     // into the graphs as kernel arguments). rope_of hands a kernel them with that call's M-RoPE table
+     Rope rope_;
+@@ -332,6 +339,8 @@ private:
+     std::vector<int> draft_index_;   // token -> its index in the draft vocabulary, -1 if not in it (mtp_attach)
+     // pieces of a layer, for the main layers and the draft layer
+     void dense(const DW& W, const void* y, float* out, CardBuf& b, int T);
++    bool gdn_project_fused(int T, int nv, CardBuf& b, const LayerW& L);
++    void attn_project(int T, CardBuf& b, const LayerW& L, bool fuse);
+     void attention(int T, CardBuf& b, const CardW& w, const LayerW& L, uint16_t* kc, uint16_t* vc, const int* ctl,
+                    uint16_t* qsa_ring, uint16_t* qsa_pooled, int call);
+     void ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW& L, float* R, const int* ctl);
+diff --git a/src/engine_common.cu b/src/engine_common.cu
+index 15108da..ca9ab63 100644
+--- a/src/engine_common.cu
++++ b/src/engine_common.cu
+@@ -526,6 +526,8 @@ void Engine::commit(int n) {
+     const int T = (int) pending_.size();
+     if (T == 0) throw std::runtime_error("commit: no window to commit");
+     if (n < 1 || n > T) throw std::runtime_error("commit: keep 1..T rows");
++    if (bench_first_snapshot_ && n > 1 && n < T)
++        throw std::runtime_error("snapshot ceiling diagnostic can only roll back to row 0");
+     if (n < T) {
+         // the window read history parity tag & 1 and wrote the other: that one becomes the kept count's history. The
+         // kept row's states and histories in one copy_many per card (Flash-Next's as cudaMemcpyAsync calls: 73 a card,
+@@ -550,7 +552,10 @@ void Engine::commit(int n) {
+             int k = 0;
+             for (int l = 0; l < NL; ++l) {
+                 if (is_attn(l)) continue;
+-                jobs[k++] = {b.S[l], b.snap[l] + (size_t) (n - 1) * w.nv() * HS * HS, sbytes};
++                if (compact_snapshots_)
++                    jobs[k++] = {b.S[l], b.snap[l], sbytes, n, w.nv()};
++                else
++                    jobs[k++] = {b.S[l], b.snap[l] + (size_t) (n - 1) * w.nv() * HS * HS, sbytes};
+                 jobs[k++] = {b.chist[l] + wrote * hfloats, b.hsnap[l] + (size_t) (n - 1) * hfloats, hfloats * 4};
+             }
+             k += hist_jobs(jobs + k, b, nullptr, (size_t) (n - 1));
+@@ -559,7 +564,8 @@ void Engine::commit(int n) {
+                     throw std::runtime_error("commit: a copy not 16-byte aligned");
+             ck(cudaMemcpyAsync(b.commit_jobs, jobs, (size_t) k * sizeof(CopyJob), cudaMemcpyHostToDevice, b.st), "commit jobs");
+             ck(cudaEventRecord(b.commit_ev, b.st), "commit event");
+-            copy_many(b.commit_jobs, k, b.st);
++            if (compact_snapshots_ && n > 1) replay_gdn_many(b.commit_jobs, k, b.st);
++            else copy_many(b.commit_jobs, k, b.st);
+         });
+     }
+     history_.insert(history_.end(), pending_.begin(), pending_.begin() + n);
+@@ -1171,7 +1177,13 @@ void Engine::commit_rows(const std::vector<int>& keep) {
+                 const size_t at = (size_t) (sg.r0[(size_t) i] + keep[i] - 1);
+                 for (int l = 0; l < NL; ++l) {
+                     if (is_attn(l)) continue;
+-                    jobs[k++] = {LD.S[(size_t) l], b.snap[l] + at * sfloats, sfloats * 4};
++                    // A segment stores its full checkpoint at its first row.
++                    // Compact updates fit in that lane's existing reserved rows.
++                    if (compact_snapshots_)
++                        jobs[k++] = {LD.S[(size_t) l], b.snap[l] + (size_t) sg.r0[(size_t) i] * sfloats,
++                                     sfloats * sizeof(float), keep[i], cw.nv()};
++                    else
++                        jobs[k++] = {LD.S[(size_t) l], b.snap[l] + at * sfloats, sfloats * 4};
+                     jobs[k++] = {LD.chist[(size_t) l] + wrote * hfloats, b.hsnap[l] + at * hfloats, hfloats * 4};
+                 }
+                 k += hist_jobs(jobs + k, b, &LD, at);
+@@ -1181,7 +1193,8 @@ void Engine::commit_rows(const std::vector<int>& keep) {
+                     throw std::runtime_error("commit_rows: a copy not 16-byte aligned");
+             ck(cudaMemcpyAsync(b.rows_commit_jobs, jobs, (size_t) k * sizeof(CopyJob), cudaMemcpyHostToDevice, b.st), "commit_rows jobs");
+             ck(cudaEventRecord(b.rows_commit_ev, b.st), "commit_rows event");
+-            copy_many(b.rows_commit_jobs, k, b.st);
++            if (compact_snapshots_) replay_gdn_many(b.rows_commit_jobs, k, b.st);
++            else copy_many(b.rows_commit_jobs, k, b.st);
+         });
+     }
+     for (int i = 0; i < nl; ++i) {
+@@ -1260,7 +1273,8 @@ int Engine::draft_rows(const std::vector<const float*>& src, int T, const std::v
+         ck(cudaEventRecord(b.ev0, b.st), "event");
+         ck(cudaGraphLaunch(b.mtp_graphs[T].exec, b.st), "graph launch");
+         const MtpCard& mc = mtp_->cards[c];
+-        const int nv = mc.dv1 - mc.dv0, last = MTP_HEAD_EVERY_ROW ? T - 1 : 0;   // the last row's head row
++        const int nv = mc.dv1 - mc.dv0;
++        const int last = MTP_HEAD_EVERY_ROW && !mtp_last_row_only_ ? T - 1 : 0;
+         if (cands && nv > 0) {   // the last row's logits are penalized already
+             ck(cudaMemsetAsync(b.mtp_tk_err, 0, 4, b.st), "draft top err");
+             fnx::top_tokens(b.mtp_logits + (size_t) last * nv, nv, 1, mc.dv0, b.mtp_zero, b.mtp_zero, b.mtp_zero, 0, b.mtp_pen_par,
+diff --git a/src/engine_impl.hpp b/src/engine_impl.hpp
+index 85d37d9..0d82959 100644
+--- a/src/engine_impl.hpp
++++ b/src/engine_impl.hpp
+@@ -34,6 +34,7 @@ struct CardBuf {
+     cudaEvent_t fork, join;
+     float *R, *mixed, *bo_a, *bo_f, *inj_a, *inj_f, *hcs;
+     void* xq;   // q8_1 rows
++    int16_t* q4k_sums = nullptr;   // exact integer sums of HC's FFN activation blocks
+     float *qkvz, *ab;
+     float* gdn_scratch;
+     float *qg, *k, *v, *att;
+diff --git a/src/gdn_core.cuh b/src/gdn_core.cuh
+index cb52bdc..0c9215b 100644
+--- a/src/gdn_core.cuh
++++ b/src/gdn_core.cuh
+@@ -14,6 +14,19 @@ namespace {
+ 
+ constexpr int GDN_Q = 4, GDN_QC = HS / GDN_Q, GDN_THREADS = GDN_QC * 4;
+ 
++// 2026-11-18: each compact update is [decay, key[HS], delta[HS]]
++// for one head and row, following one full checkpoint (row 0).
++constexpr int GDN_UPDATE = 1 + 2 * HS;
++// A compact update fits in one of the original full-state slots, so
++// segment-local writes cannot overwrite another lane's reserved rows.
++static_assert(GDN_UPDATE <= HS * HS, "compact updates must fit inside each segment");
++__device__ __forceinline__ float gdn_update(float prior, float decay, float key, float delta) {
++    // sm_70 CUDA 12.9 upstream SASS rounds key * delta first, then
++    // fuses decay * prior with that product.
++    return fmaf(decay, prior, __fmul_rn(key, delta));
++}
++
++
+ template <int T>
+ __global__ void __launch_bounds__(GDN_THREADS) k_gdn_core(const float* __restrict__ qkvz, const float* __restrict__ ab,
+                                                          float* __restrict__ hist, const float* __restrict__ convw,
+@@ -150,13 +163,29 @@ __global__ void __launch_bounds__(GDN_THREADS) k_gdn_core(const float* __restric
+         kvd += __shfl_xor_sync(0xffffffffu, kvd, 1);
+         kvd += __shfl_xor_sync(0xffffffffu, kvd, 2);
+         const float delta = (vs[t][cl] - gv * kvd) * bv;
++        const bool compact_row = gl.compact_snapshot && t > 0 && t < T - 1;
++        if (compact_row) {
++            float* u = snap + (size_t) nv * HS * HS + ((size_t) (t - 1) * nv + lv) * GDN_UPDATE;
++            if (qq == 0) {
++                if (tid == 0) u[0] = gv;
++                u[1 + tid] = xs[1][t][tid % 32][tid / 32];
++            }
++            if (part == 0) u[1 + HS + col] = delta;
++        }
+         float at0 = 0.f, at1 = 0.f, at2 = 0.f, at3 = 0.f;
+ #pragma unroll
+         for (int r = 0; r < 32; r += 4) {
+-            s[r] = gv * s[r] + xs[1][t][r][part] * delta;
+-            s[r + 1] = gv * s[r + 1] + xs[1][t][r + 1][part] * delta;
+-            s[r + 2] = gv * s[r + 2] + xs[1][t][r + 2][part] * delta;
+-            s[r + 3] = gv * s[r + 3] + xs[1][t][r + 3][part] * delta;
++            if (gl.compact_snapshot) {
++                s[r] = gdn_update(s[r], gv, xs[1][t][r][part], delta);
++                s[r + 1] = gdn_update(s[r + 1], gv, xs[1][t][r + 1][part], delta);
++                s[r + 2] = gdn_update(s[r + 2], gv, xs[1][t][r + 2][part], delta);
++                s[r + 3] = gdn_update(s[r + 3], gv, xs[1][t][r + 3][part], delta);
++            } else {
++                s[r] = gv * s[r] + xs[1][t][r][part] * delta;
++                s[r + 1] = gv * s[r + 1] + xs[1][t][r + 1][part] * delta;
++                s[r + 2] = gv * s[r + 2] + xs[1][t][r + 2][part] * delta;
++                s[r + 3] = gv * s[r + 3] + xs[1][t][r + 3][part] * delta;
++            }
+             at0 += s[r] * xs[0][t][r][part];
+             at1 += s[r + 1] * xs[0][t][r + 1][part];
+             at2 += s[r + 2] * xs[0][t][r + 2][part];
+@@ -166,7 +195,9 @@ __global__ void __launch_bounds__(GDN_THREADS) k_gdn_core(const float* __restric
+         at += __shfl_xor_sync(0xffffffffu, at, 1);
+         at += __shfl_xor_sync(0xffffffffu, at, 2);
+         ov[t] = at * scale;
+-        if (t < T - 1) {
++        // 2026-11-18 diagnostic: keep the one rollback point fnx_run bench
++        // actually consumes. The full intermediate values are still computed.
++        if (t < T - 1 && (!(gl.first_snapshot || gl.compact_snapshot) || t == 0)) {
+             float* sp = snap + (size_t) t * nv * HS * HS + (st - S);
+ #pragma unroll
+             for (int r = 0; r < 32; ++r) sp[(size_t) r * HS] = s[r];
+diff --git a/src/hc.cuh b/src/hc.cuh
+index 51ddeb3..50db546 100644
+--- a/src/hc.cuh
++++ b/src/hc.cuh
+@@ -14,11 +14,18 @@
+ // second-stream branches fork after it). A barrier that waits too long sets bit 4 of err.
+ namespace {
+ 
+-// row groups of 96 rows: lo's quantization blocks (32 rows) never straddle two groups
+-constexpr int H_SL = 512, H_NS = D / H_SL, H_SPS = N / H_SL, H_RPG = 96;
++// 2026-11-18: the three-card Flash-Next V100 grid can use the same 80
++// CTAs with smaller, more even down-row groups. Quantization groups are
++// formed later from the completed row-indexed partials, after grid_sync.
++constexpr int H_SL = 512, H_NS = D / H_SL, H_SPS = N / H_SL;
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++constexpr int H_RPG = 84;
++#else
++constexpr int H_RPG = 96;
++#endif
+ constexpr int H_ROWS = LR + HC, H_RG = (H_ROWS + H_RPG - 1) / H_RPG;
+-static_assert(H_RPG % 32 == 0, "lo blocks inside a group");
+ constexpr int H_TPRD = 8, H_DT = (H_RPG * H_TPRD + 31) / 32 * 32, H_BLOCKS = H_NS * H_RG;
++static_assert(H_RG == 4 && (H_RPG * H_TPRD) % 32 == 0, "four groups of whole down warps");
+ // up: 32 columns per block, H_TPRU lanes per column; lane b < LR / 32 takes lo's 32-value block b
+ constexpr int H_UPC = 32, H_TPRU = 16, H_UB = LR / 32;
+ static_assert(H_BLOCKS * H_UPC == N, "one up block per down block");
+@@ -47,6 +54,7 @@ struct HcArgs {
+     block_q8_1* q8;      // mixed as q8_1 too, or null
+     int8_t* tq = nullptr;   // and its split twin, or null
+     float* td = nullptr;
++    int16_t* q4k_sums = nullptr;   // opt-in, one exact code sum per q8_1 block
+ };
+ 
+ __device__ __forceinline__ float rprime(const HcArgs& a, int t, int c, int i) {
+@@ -113,8 +121,28 @@ template <int T> struct HcUp {
+ // WALK: the grid is short of H_BLOCKS and each block takes the shares vb = blockIdx.x + k * gridDim.x in turn; else
+ // vb = blockIdx.x alone, without the loops (the walk costs a register over the 79 of 80 SMs' form, and a stack slot at
+ // T = 15)
+-template <int T, bool ONE, bool WALK>
++__device__ __forceinline__ void hc_store_q8(const HcArgs& a, int b, int k, int lane, float xi) {
++    const float amax = wmax(fabsf(xi)), sm = wsum(xi);
++    const float dq = amax / 127.0f;
++    block_q8_1& yq = a.q8[(size_t) k * (N / 32) + b];
++    const int8_t qv = amax == 0.0f ? 0 : (int8_t) roundf(xi / dq);
++    yq.qs[lane] = qv;
++    if (lane == 0) yq.ds = make_half2(__float2half(dq), __float2half(sm));
++    if (a.q4k_sums) {
++        int sum = qv;
++#pragma unroll
++        for (int bit = 16; bit; bit >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, bit);
++        if (lane == 0) a.q4k_sums[(size_t) k * (N / 32) + b] = static_cast<int16_t>(sum);
++    }
++    if (a.tq) {
++        a.tq[(size_t) k * N + b * 32 + lane] = qv;
++        if (lane == 0) a.td[(size_t) k * (N / 32) + b] = __half2float(__float2half(dq));
++    }
++}
++
++template <int T, bool ONE, bool WALK, bool WARP_OUT = false, bool STRIPED_REDUCE = false>
+ __global__ void __launch_bounds__(H_DT, 1) k_hc(HcArgs a) {
++    static_assert(!STRIPED_REDUCE || (!ONE && !WALK && T <= 8));
+     static_assert(sizeof(HcUp<T>) <= sizeof(float) * T * H_SL && LR % 16 == 0, "the up part's arrays inside xs, aligned");
+     __shared__ __align__(16) float xs[T][H_SL];
+     __shared__ __align__(16) int8_t xq[T][H_SL];
+@@ -170,12 +198,16 @@ __global__ void __launch_bounds__(H_DT, 1) k_hc(HcArgs a) {
+         const int j = t % H_TPRD, row = grp * H_RPG + t / H_TPRD;
+         const int nrows = a.w_inj ? H_ROWS : LR;
+         const bool live = t / H_TPRD < H_RPG && row < nrows;
+-        const int rr = live ? row : 0;
++        // 2026-11-18 experiment: do not load/dot a dummy row in idle warps.
++        // Both boundaries are warp-aligned: live warps still participate
++        // in the same full-mask shuffles as before.
++        static_assert((H_RPG * H_TPRD) % 32 == 0 && (LR * H_TPRD) % 32 == 0 &&
++                          (H_ROWS * H_TPRD) % 32 == 0, "whole down warps");
+         // the thread's weights to registers, then one pass per row t (rolled: unrolled over T the kernel is tens of KB
+         // of code, fetched cold at every launch)
+-        if (rr < LR) {
+-            const uint2* w2 = reinterpret_cast<const uint2*>(a.w_down.q + (size_t) rr * D + col0);
+-            const uint16_t* wd = a.w_down.d + ((size_t) rr * D + col0) / 32;
++        if (live && row < LR) {
++            const uint2* w2 = reinterpret_cast<const uint2*>(a.w_down.q + (size_t) row * D + col0);
++            const uint16_t* wd = a.w_down.d + ((size_t) row * D + col0) / 32;
+             uint2 u[NQ];
+             float sc[NQ];
+ #pragma unroll
+@@ -192,10 +224,10 @@ __global__ void __launch_bounds__(H_DT, 1) k_hc(HcArgs a) {
+                     acc = fmaf(sc[q] * xd[k][ch / 4], (float) dot8i(u[q], *reinterpret_cast<const int2*>(&xq[k][ch * 8])), acc);
+                 }
+                 for (int o = 1; o < H_TPRD; o <<= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+-                if (live && j == 0) a.part[((size_t) s * T + k) * H_ROWS + row] = acc;
++                if (j == 0) a.part[((size_t) s * T + k) * H_ROWS + row] = acc;
+             }
+-        } else {
+-            const uint4* w4 = reinterpret_cast<const uint4*>(a.w_inj + (size_t) (rr - LR) * D + col0);
++        } else if (live) {
++            const uint4* w4 = reinterpret_cast<const uint4*>(a.w_inj + (size_t) (row - LR) * D + col0);
+             uint4 u[NQ];
+ #pragma unroll
+             for (int q = 0; q < NQ; ++q) u[q] = __ldg(w4 + q * H_TPRD + j);
+@@ -212,7 +244,7 @@ __global__ void __launch_bounds__(H_DT, 1) k_hc(HcArgs a) {
+                            bf(hh[5]) * x1.y + bf(hh[6]) * x1.z + bf(hh[7]) * x1.w;
+                 }
+                 for (int o = 1; o < H_TPRD; o <<= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+-                if (live && j == 0) a.part[((size_t) s * T + k) * H_ROWS + row] = acc;
++                if (j == 0) a.part[((size_t) s * T + k) * H_ROWS + row] = acc;
+             }
+         }
+     }
+@@ -277,7 +309,13 @@ __global__ void __launch_bounds__(H_DT, 1) k_hc(HcArgs a) {
+     // ---------------- reduce: item (token k, lo block b) per warp, then each token's inject rows
+     {
+         constexpr int ITEMS = T * (LR / 32) + T;
+-        for (int it = blockIdx.x * (H_DT / 32) + warp; it < ITEMS; it += grid * (H_DT / 32)) {
++        // 2026-11-19: spread the same independent reduction warps over
++        // more SMs. For T=8, five CTAs before, 22 after. Reduce each item
++        // in exactly the old lane and floating-point summation order.
++        constexpr int RPW = STRIPED_REDUCE ? 4 : H_DT / 32;
++        static_assert(!STRIPED_REDUCE || ITEMS <= H_BLOCKS * RPW);
++        const int first = STRIPED_REDUCE && warp >= RPW ? ITEMS : blockIdx.x * RPW + warp;
++        for (int it = first; it < ITEMS; it += grid * RPW) {
+             const bool inj_item = it >= T * (LR / 32);
+             const int k = inj_item ? it - T * (LR / 32) : it / (LR / 32);
+             // every lane runs the same path (q8_block shuffles across the warp); only an inject item's first HC lanes
+@@ -345,8 +383,27 @@ __global__ void __launch_bounds__(H_DT, 1) k_hc(HcArgs a) {
+         }                                                                      // every lane (here a warp issued it for 2)
+     }
+     __syncthreads();
+-    // item (k, c, col): this block's 32 columns of stream c, row k, coalesced along the columns
+     const int b = vb;
++    if constexpr (WARP_OUT) {
++        // 2026-11-19: each warp owns one output row, so it can move through
++        // mixing and quantization without exchanging data with other warps.
++        static_assert(H_UPC == 32 && HC == 4 && T <= H_DT / 32);
++        if (warp < T) {
++            const int k = warp, dc = b * H_UPC + lane;
++            float g[HC];
++#pragma unroll
++            for (int cc = 0; cc < HC; ++cc) {
++                const float rv = rprime(a, k, cc, dc);
++                if (a.bo) a.R[(size_t) k * D + cc * N + dc] = rv;
++                g[cc] = sigm(gs[k][cc][lane]) * (rv * a.w_norm[cc * N + dc] * rs[k][cc]);
++            }
++            const float sum = (g[0] + g[1] + g[2] + g[3]) / (float) HC;
++            a.mixed[(size_t) k * N + dc] = sum;
++            if (a.q8) hc_store_q8(a, b, k, lane, sum);
++        }
++        continue;
++    }
++    // item (k, c, col): this block's 32 columns of stream c, row k, coalesced along the columns
+     for (int e = t; e < T * HC * H_UPC; e += H_DT) {
+         const int col = e % H_UPC, cc = (e / H_UPC) % HC, k = e / (H_UPC * HC), dc = b * H_UPC + col;
+         const float rv = rprime(a, k, cc, dc);
+@@ -371,6 +428,13 @@ __global__ void __launch_bounds__(H_DT, 1) k_hc(HcArgs a) {
+         const int8_t qv = amax == 0.0f ? 0 : (int8_t) roundf(xi / dq);
+         yq.qs[lane] = qv;
+         if (lane == 0) yq.ds = make_half2(__float2half(dq), __float2half(sm));
++        if (a.q4k_sums) {
++            int sum = qv;
++#pragma unroll
++            for (int bit = 16; bit; bit >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, bit);
++            if (lane == 0)
++                a.q4k_sums[(size_t) warp * (N / 32) + b] = static_cast<int16_t>(sum);
++        }
+         if (a.tq) {
+             a.tq[(size_t) warp * N + b * 32 + lane] = qv;
+             if (lane == 0) a.td[(size_t) warp * (N / 32) + b] = __half2float(__float2half(dq));
+@@ -381,6 +445,30 @@ __global__ void __launch_bounds__(H_DT, 1) k_hc(HcArgs a) {
+ 
+ // one: k_hc's one-barrier form (built for windows of up to 8 rows); grid: the card's, from hc_prepare
+ template <int T> void hc_launch(const HcArgs& a, cudaStream_t st, bool one, int grid) {
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++    if constexpr (T >= 4 && T <= 8) {
++        static const bool striped_reduce = env_flag("FNX_RM400_HC_STRIPED_REDUCE");
++        if (striped_reduce && !one && grid == H_BLOCKS) {
++            k_hc<T, false, false, false, true><<<grid, H_DT, 0, st>>>(a);
++            return;
++        }
++    }
++    static const bool warp_out = env_flag("FNX_RM400_HC_WARP_OUT");
++    // Narrow windows keep the upstream path: fewer warps may not hide the
++    // added per-warp work. WALK is excluded from this first screening run.
++    if constexpr (T >= 4 && T <= H_DT / 32) {
++        if (warp_out && grid == H_BLOCKS) {
++            if constexpr (T <= 8) {
++                if (one) {
++                    k_hc<T, true, false, true><<<grid, H_DT, 0, st>>>(a);
++                    return;
++                }
++            }
++            k_hc<T, false, false, true><<<grid, H_DT, 0, st>>>(a);
++            return;
++        }
++    }
++#endif
+     if constexpr (T <= 8) {
+         if (one) {
+             if (grid < H_BLOCKS) k_hc<T, true, true><<<grid, H_DT, 0, st>>>(a);
+diff --git a/src/kernels.cu b/src/kernels.cu
+index 3598af4..822fde3 100644
+--- a/src/kernels.cu
++++ b/src/kernels.cu
+@@ -262,12 +262,12 @@ __device__ __forceinline__ void gemv4_block(const float* __restrict__ W, const f
+ 
+ // a Q8_0 matrix (q8s) and a small f32 one (gemv_f32's block-per-row case) in one launch instead of two streams: the
+ // f32 rows' blocks first (short; they start at once), then the q8s blocks
+-template <int T, int R, bool SPLIT>
++template <int T, int R, bool SPLIT, int TOKEN_TILE = 0>
+ __global__ void __launch_bounds__(Q8S_THREADS) k_q8s_ab(const Q8Segs g, int rows, int cols, const block_q8_1* __restrict__ y,
+                                                        const int8_t* __restrict__ tq, const float* __restrict__ td, const float* __restrict__ W,
+                                                        const float* __restrict__ x, float* __restrict__ yf, int rf) {
+     if ((int) blockIdx.x < rf) gemv4_block<T>(W, x, yf, rf, blockIdx.x);
+-    else q8s_block<T, R, SPLIT, false>(g, rows, cols, y, tq, td, blockIdx.x - rf);
++    else q8s_block<T, R, SPLIT, false, TOKEN_TILE>(g, rows, cols, y, tq, td, blockIdx.x - rf);
+ }
+ 
+ // ---------------------------------------------------------------- hyper-connection read
+@@ -508,6 +508,15 @@ __global__ void __launch_bounds__(HD) k_attn_part(const float* qg, const __half*
+     const int h0 = g0 - q0, nh = g1 - g0;
+     const int len = ((ctx + ATT_SPLITS - 1) / ATT_SPLITS + ATT_CH - 1) / ATT_CH * ATT_CH;
+     const int p0 = s * len, p1 = min(ctx, p0 + len);
++    // 2026-11-18: an empty split's consumers read only its marker.
++    // Leave its accumulator untouched and skip the shared-memory setup.
++    if (p0 >= p1) {
++        for (int h = i; h < nh; h += HD) {
++            const size_t slot = ((size_t) t * nq + h0 + h) * ATT_SPLITS + s;
++            mz_out[slot] = AttPart{-INFINITY, 0.f};
++        }
++        return;
++    }
+     __shared__ float q[ATT_MAXH][HD];
+     __shared__ float kk[ATT_CH][HD + 1];
+     __shared__ float e[ATT_MAXH][ATT_CH];
+@@ -794,15 +803,28 @@ __device__ __forceinline__ int chi(int k) { return (k + 1) * NP / NCARD; }
+ __device__ __forceinline__ float2 add2(float2 a, float2 b) { return make_float2(a.x + b.x, a.y + b.y); }
+ 
+ // this card's addend for element (t, i): x, or the routed experts' weighted rows plus the gated shared row
+-__device__ __forceinline__ float ring_x(const float* x, const RingMoe& m, int T, int t, int i) {
+-    if (!m.part) return x[(size_t) t * N + i];
+-    float s = 0.f;
++__device__ __forceinline__ float2 ring_x2(const float* x, const RingMoe& m, int T, int t, int p) {
++    // 2026-11-18: use aligned paired reads, without reassociating either sum.
++    static_assert(N == 2 * NP, "ring rows must be whole pairs");
++    if (!m.part) return reinterpret_cast<const float2*>(x)[(size_t) t * NP + p];
++    const float2* values = reinterpret_cast<const float2*>(m.part);
++    float2 sum = make_float2(0.f, 0.f);
+ #pragma unroll
+-    for (int k = 0; k < TOPK; ++k) s = fmaf(m.topw[t * TOPK + k], m.part[((size_t) t * TOPK + k) * N + i], s);
+-    return fmaf(sigm(m.logits[(size_t) t * (NEXP + 1) + NEXP]), m.part[((size_t) T * TOPK + t) * N + i], s);
++    for (int k = 0; k < TOPK; ++k) {
++        const float wt = m.topw[t * TOPK + k];
++        const float2 v = values[((size_t) t * TOPK + k) * NP + p];
++        sum.x = fmaf(wt, v.x, sum.x);
++        sum.y = fmaf(wt, v.y, sum.y);
++    }
++    const float wt = sigm(m.logits[(size_t) t * (NEXP + 1) + NEXP]);
++    const float2 v = values[((size_t) T * TOPK + t) * NP + p];
++    return make_float2(fmaf(wt, v.x, sum.x), fmaf(wt, v.y, sum.y));
+ }
+-__device__ __forceinline__ float2 ring_x2(const float* x, const RingMoe& m, int T, int t, int p) {
+-    return make_float2(ring_x(x, m, T, t, 2 * p), ring_x(x, m, T, t, 2 * p + 1));
++
++__device__ __forceinline__ float2 ring_local_before_wait(const float* x, const RingMoe& m, int T, int t, int p) {
++    float2 v = ring_x2(x, m, T, t, p);
++    asm volatile("" : "+f"(v.x), "+f"(v.y) : : "memory");
++    return v;
+ }
+ 
+ template <bool F32>
+@@ -837,16 +859,18 @@ __global__ void k_ring(Ring r, float* x, int T, const unsigned* tagp, int call,
+         const int c = (g + NCARD - s) % NCARD, lo = clo(c), len = chi(c) - lo;
+         for (int e = tid; e < T * len; e += n) {
+             const int t = e / len, i = e % len;
++            const float2 local = ring_local_before_wait(x, m, T, t, lo + i);
+             const float2 a = take(slot(in, s - 1, t, i), tag);
+-            put(slot(nin, s, t, i), add2(a, ring_x2(x, m, T, t, lo + i)), tag);
++            put(slot(nin, s, t, i), add2(a, local), tag);
+         }
+     }
+     {   // step NCARD - 1: chunk g+1 with the other cards' parts; add mine: finished. Keep it, send it on
+         const int c = (g + 1) % NCARD, lo = clo(c), len = chi(c) - lo;
+         for (int e = tid; e < T * len; e += n) {
+             const int t = e / len, i = e % len;
++            const float2 local = ring_local_before_wait(x, m, T, t, lo + i);
+             const float2 a = take(slot(in, RSTEPS - 1, t, i), tag);
+-            const float2 v = add2(a, ring_x2(x, m, T, t, lo + i));
++            const float2 v = add2(a, local);
+             put(ag + ((size_t) t * NP + lo + i) * W, v, tag);
+             put(nag + ((size_t) t * NP + lo + i) * W, v, tag);
+         }
+@@ -1053,7 +1077,7 @@ int hc_prepare(float* scratch, int cap) {
+ 
+ void hc_read(float* R, const float* bo, const float* inj_prev, const float* w_norm, const Q8S& w_down, const Q8S& w_up,
+              const uint16_t* w_inj, float eps, float* mixed, float* inject, float* scratch, unsigned* err, int T, void* st,
+-             void* q8) {
++             void* q8, int16_t* q4k_sums) {
+     HcArgs a{R, bo, inj_prev, w_norm, w_down, w_up, w_inj, eps, mixed, inject, nullptr, nullptr, nullptr, nullptr, nullptr, err,
+              (block_q8_1*) q8};
+     a.part = scratch;
+@@ -1063,6 +1087,7 @@ void hc_read(float* R, const float* bo, const float* inj_prev, const float* w_no
+     // the barrier's counter: the last float of a scratch sized for MAXT rows, so it stays put whatever T is
+     a.bar = (unsigned*) (scratch + hc_scratch_floats(MAXT) - 1);
+     if (q8) twin_of(q8, N, a.tq, a.td);
++    a.q4k_sums = q4k_sums;
+     cudaStream_t s = (cudaStream_t) st;
+     const bool one = T <= hc1_rows();
+     const int grid = hc_grid();
+@@ -1163,13 +1188,20 @@ void qsa_index(const float* y, const float* qn, const float* kn, uint16_t* ring,
+     ck_launch("qsa_index");
+ }
+ 
++void qsa_index_lanes(const float* y, const float* qn, const float* kn, uint16_t* pooled, const KvPages& g, float* q,
++                     const LaneAttPrep& prep, int T, float eps, Rope base, void* st) {
++    k_idx_prep_pool_lanes<<<dim3(T, QSA_HEADS + 2), QSA_DIM, 0, (cudaStream_t) st>>>(
++        y, qn, kn, qsa_ring, q, reinterpret_cast<__half*>(pooled), g, prep, eps, base);
++    ck_launch("qsa_index_lanes");
++}
++
+ void qsa_select(const float* q, const uint16_t* pooled, const KvPages& g, float* scores, int* cells, int* n_cells, int max_pools, const int* pos0, int T,
+                 int card, void* st) {
+     cudaStream_t s = (cudaStream_t) st;
+     const __half* pl = reinterpret_cast<const __half*>(pooled);
+     k_idx_score_tc<<<dim3((max_pools + QSC_KEYS - 1) / QSC_KEYS, (T + QSC_ROWS - 1) / QSC_ROWS), 256, 0, s>>>(q, pl, g, scores, max_pools,
+                                                                                                          pos0, T);
+-    k_idx_select<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, pos0, card, LaneRows{});
++    k_idx_select<><<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, pos0, card, LaneRows{});
+     ck_launch("qsa_select");
+ }
+ 
+@@ -1185,7 +1217,13 @@ void qsa_select_lanes(const float* q, const uint16_t* pooled, const KvPages& g,
+     }
+     const __half* pl = reinterpret_cast<const __half*>(pooled);
+     k_idx_score<<<dim3((max_pools + 255) / 256, T), 256, 0, s>>>(q, pl, g, scores, max_pools, nullptr, lr);
+-    k_idx_select<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, nullptr, card, lr);
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++    static const bool striped = env_flag("FNX_RM400_QSA_STRIPED_HIST");
++    if (striped)
++        k_idx_select<4><<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, nullptr, card, lr);
++    else
++#endif
++        k_idx_select<><<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, nullptr, card, lr);
+     ck_launch("qsa_select_lanes");
+ }
+ int qsa_rows() { return QSA_ROWS; }
+@@ -1233,8 +1271,21 @@ void qsa(const uint16_t* wq, const uint16_t* wk, const float* x, float* y, const
+         ck_launch("qsa");
+         return;
+     }
+-    k_idx_score<<<dim3((max_pools + 255) / 256, T), 256, 0, s>>>(q, pl, g, scores, max_pools, pos0, LaneRows{});
+-    k_idx_select<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, pos0, card, LaneRows{});
++    const int tiles = (max_pools + 255) / 256;
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++    static const bool paired = env_flag("FNX_RM400_QSA_PAIRED");
++    if (paired && T > 1)
++        k_idx_score_pair<<<dim3(tiles, (T + 1) / 2), 256, 0, s>>>(q, pl, g, scores, max_pools, pos0, T);
++    else
++#endif
++        k_idx_score<<<dim3(tiles, T), 256, 0, s>>>(q, pl, g, scores, max_pools, pos0, LaneRows{});
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++    static const bool striped = env_flag("FNX_RM400_QSA_STRIPED_HIST");
++    if (striped)
++        k_idx_select<4><<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, pos0, card, LaneRows{});
++    else
++#endif
++        k_idx_select<><<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, pos0, card, LaneRows{});
+     ck_launch("qsa");
+ }
+ 
+@@ -1430,9 +1481,21 @@ void ring_sum(const Ring& r, float* x, int T, const unsigned* tag, int call, voi
+         ck_launch("ring_sum (chunk)");
+         return;
+     }
+-    const int grid = std::max(4, std::min(T > MAXT ? 240 : 40, (T * NP / NCARD + 255) / 256));
+-    if (r.f32) k_ring<true><<<grid, 256, 0, (cudaStream_t) st>>>(r, x, T, tag, call, m);
+-    else k_ring<false><<<grid, 256, 0, (cudaStream_t) st>>>(r, x, T, tag, call, m);
++    int threads = 256, cap = T > MAXT ? 240 : 40;
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++    // 2026-11-18: spread the short graph's independent ring lanes
++    // over more of the V100's SMs; leave the prompt ring alone.
++    if (T <= MAXT) {
++        static const long long requested = env_int("FNX_RM400_RING_THREADS", 256);
++        if (requested != 64 && requested != 128 && requested != 256)
++            throw std::runtime_error("FNX_RM400_RING_THREADS: expected 64, 128, or 256");
++        threads = requested;
++        if (threads != 256) cap = 80;
++    }
++#endif
++    const int grid = std::max(4, std::min(cap, (T * NP / NCARD + threads - 1) / threads));
++    if (r.f32) k_ring<true><<<grid, threads, 0, (cudaStream_t) st>>>(r, x, T, tag, call, m);
++    else k_ring<false><<<grid, threads, 0, (cudaStream_t) st>>>(r, x, T, tag, call, m);
+     ck_launch("ring_sum");
+ }
+ 
+@@ -1470,19 +1533,48 @@ void penalize_row(float* row, int n, const int* pen, const float* par, void* st)
+ }
+ 
+ namespace {
++template <bool REPLAY>
+ __global__ void k_copy_many(const CopyJob* jobs) {
+     const CopyJob j = jobs[blockIdx.y];
+     float4* d = reinterpret_cast<float4*>(j.dst);
+     const float4* s = reinterpret_cast<const float4*>(j.src);
++    if constexpr (REPLAY) {
++        if (j.replay_keep > 1) {
++            const int nv = j.replay_heads;
++            const float* updates = reinterpret_cast<const float*>(s) + (size_t) nv * HS * HS;
++            for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < j.bytes / 16; i += (size_t) gridDim.x * blockDim.x) {
++                static_assert(HS % 4 == 0, "aligned state vectors");
++                const int head = (4 * i) / (HS * HS), row = (4 * i / HS) % HS, col = 4 * i % HS;
++                float4 v = s[i];
++                for (int t = 1; t < j.replay_keep; ++t) {
++                    const float* u = updates + ((size_t) (t - 1) * nv + head) * GDN_UPDATE;
++                    const float decay = u[0], key = u[1 + row];
++                    const float* delta = u + 1 + HS + col;
++                    v.x = gdn_update(v.x, decay, key, delta[0]);
++                    v.y = gdn_update(v.y, decay, key, delta[1]);
++                    v.z = gdn_update(v.z, decay, key, delta[2]);
++                    v.w = gdn_update(v.w, decay, key, delta[3]);
++                }
++                d[i] = v;
++            }
++            return;
++        }
++    }
+     for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < j.bytes / 16; i += (size_t) gridDim.x * blockDim.x) d[i] = s[i];
+ }
+ }  // namespace
+ 
+ void copy_many(const CopyJob* jobs, int n, void* st) {
+     if (n <= 0) return;
+-    k_copy_many<<<dim3(8, n), 256, 0, (cudaStream_t) st>>>(jobs);
++    k_copy_many<false><<<dim3(8, n), 256, 0, (cudaStream_t) st>>>(jobs);
+     ck_launch("copy_many");
+ }
++
++void replay_gdn_many(const CopyJob* jobs, int n, void* st) {
++    if (n <= 0) return;
++    k_copy_many<true><<<dim3(8, n), 256, 0, (cudaStream_t) st>>>(jobs);
++    ck_launch("replay_gdn_many");
++}
+ #endif
+ 
+ }  // namespace fnx
+@@ -1536,9 +1628,9 @@ __global__ void k_kv_append(const float* k, const float* v, __half* kc, __half*
+ // k_attn_prep and k_kv_append in one launch: block (h, row t), HD threads; h < NQH: q head h normed and rotated; then
+ // the NKVH k heads, normed, rotated and appended; then the NKVH v heads, appended (a row whose position is another
+ // card's appends nothing). The same values as the two kernels
+-__global__ void __launch_bounds__(HD) k_attn_prep_append(float* qg, float* k, const float* v, const float* qn, const float* kn, __half* kc,
+-                                                         __half* vc, KvPages g, int card, const int* pos0p, float eps, Rope base) {
+-    const int t = blockIdx.y, h = blockIdx.x, i = threadIdx.x, p = *pos0p + t, j = p / 4;
++__device__ __forceinline__ void attn_prep_append_row(float* qg, float* k, const float* v, const float* qn, const float* kn,
++                                                    __half* kc, __half* vc, KvPages g, int card, int p, float eps, const Rope& base) {
++    const int t = blockIdx.y, h = blockIdx.x, i = threadIdx.x, j = p / 4;
+     __shared__ float sh[32];
+     if (h < NQH) {
+         norm_rope(qg + ((size_t) t * NQH + h) * 2 * HD, qn, p, eps, base, sh);
+@@ -1567,6 +1659,19 @@ __global__ void __launch_bounds__(HD) k_attn_prep_append(float* qg, float* k, co
+     }
+     cache[kvp_row(g, r) + e] = __float2half_rn(x);
+ }
++
++__global__ void __launch_bounds__(HD) k_attn_prep_append(float* qg, float* k, const float* v, const float* qn, const float* kn, __half* kc,
++                                                        __half* vc, KvPages g, int card, const int* pos0p, float eps, Rope base) {
++    attn_prep_append_row(qg, k, v, qn, kn, kc, vc, g, card, *pos0p + (int) blockIdx.y, eps, base);
++}
++
++__global__ void __launch_bounds__(HD) k_attn_prep_append_lanes(float* qg, float* k, const float* v, const float* qn, const float* kn,
++                                                              __half* kc, __half* vc, KvPages g, LaneAttPrep prep, int card, float eps, Rope base) {
++    const int t = blockIdx.y;
++    base.tab = prep.rot[t];
++    attn_prep_append_row(qg, k, v, qn, kn, kc, vc, row_pages(g, prep.rows, t), card,
++                         row_pos(prep.rows, nullptr, t), eps, base);
++}
+ }  // namespace
+ namespace {
+ // FNX_PREFETCH_PROBE: guess[t][k], the top 10 of logits row t (NEXP each; ties: the lower index), a warp per row
+@@ -1634,8 +1739,9 @@ __global__ void k_route_trace(const int* topi, int n, int layer, unsigned* trace
+ }  // namespace
+ namespace {
+ // the plan alone (cache_plan, moe.cuh), one warp
+-__global__ void __launch_bounds__(32) k_cache_plan(const Job* jobs, const int* njobs, int layer, ExpertCache ec, int* list) {
+-    cache_plan(jobs, njobs[0], layer, ec, list);
++__global__ void __launch_bounds__(32) k_cache_plan(const Job* jobs, const int* njobs, int layer, ExpertCache ec, int* list,
++                                                   bool fast_hits) {
++    cache_plan(jobs, njobs[0], layer, ec, list, fast_hits);
+ }
+ // the listed experts' matrices (gu_bytes and dn_bytes each, multiples of 16: the layer's) from their host copies to
+ // their slots in pool p
+@@ -1660,8 +1766,27 @@ void moe_cache(int layer, size_t gu_stride, size_t dn_stride, const ExpertCache&
+     const int p = ec.pool_of[layer];
+     if (gu_stride != ec.dn_off[p] || ec.dn_off[p] + dn_stride != ec.slot_bytes[p])
+         throw std::runtime_error("moe_cache: the layer's experts are not its pool's size");
+-    if (jobs) k_cache_plan<<<1, 32, 0, (cudaStream_t) st>>>(jobs, njobs, layer, ec, list);
+-    k_cache_copy<<<160, 256, 0, (cudaStream_t) st>>>(ec, p, list, gu_stride, dn_stride);
++    if (jobs) {
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++        static const bool fast_hits = env_flag("FNX_RM400_CACHE_ALL_HIT");
++#else
++        constexpr bool fast_hits = false;
++#endif
++        k_cache_plan<<<1, 32, 0, (cudaStream_t) st>>>(jobs, njobs, layer, ec, list, fast_hits);
++    }
++    // 2026-11-19: only the decode grid. Try one, two or four CTAs per
++    // V100 SM against the same byte-copy loop and route plan.
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++    static const int blocks = [] {
++        const auto n = env_int("FNX_RM400_EXPERT_COPY_GRID", 160);
++        if (n != 80 && n != 160 && n != 320)
++            throw std::runtime_error("FNX_RM400_EXPERT_COPY_GRID: expected 80, 160 or 320");
++        return (int) n;
++    }();
++#else
++    constexpr int blocks = 160;
++#endif
++    k_cache_copy<<<blocks, 256, 0, (cudaStream_t) st>>>(ec, p, list, gu_stride, dn_stride);
+     ck_launch("moe_cache");
+ }
+ namespace {
+@@ -1729,6 +1854,13 @@ void attn_prep_append(float* qg, float* k, const float* v, const float* q_norm,
+                                                                           reinterpret_cast<__half*>(vc), g, card, pos0, eps, base);
+     ck_launch("attn_prep_append");
+ }
++
++void attn_prep_append_lanes(float* qg, float* k, const float* v, const float* qn, const float* kn, uint16_t* kc, uint16_t* vc,
++                            const KvPages& g, const LaneAttPrep& prep, int card, int T, float eps, Rope base, void* st) {
++    k_attn_prep_append_lanes<<<dim3(NQH + 2 * NKVH, T), HD, 0, (cudaStream_t) st>>>(
++        qg, k, v, qn, kn, reinterpret_cast<__half*>(kc), reinterpret_cast<__half*>(vc), g, prep, card, eps, base);
++    ck_launch("attn_prep_append_lanes");
++}
+ }  // namespace fnx
+ #endif
+ 
+@@ -1738,13 +1870,16 @@ size_t gdn_scratch_floats(int nv) { return (size_t) MAXT * nv * HS + (size_t) nv
+ 
+ void gdn_core(const float* qkvz, const float* ab, float* hist, const float* convw, const float* dt, const float* a, const float* nw,
+               float* S, void* yq, const int* ctl, float* scratch, float* snap, float* hsnap, int nk, int nv, const int* vmap, int T,
+-              float eps, void* st, float* y32) {
++              float eps, void* st, float* y32, bool first_snapshot, bool compact_snapshot) {
+     cudaStream_t s = (cudaStream_t) st;
+     block_q8_1* y = (block_q8_1*) yq;
+     int8_t* tq;
+     float* td;
+     twin_of(yq, nv * HS, tq, td);
+-#define FNX_GDN(t) k_gdn_core<t><<<nv * GDN_Q, GDN_THREADS, 0, s>>>(qkvz, ab, hist, convw, dt, a, nw, S, y, ctl, scratch, snap, hsnap, nk, nv, vmap, eps, tq, td, y32, GdnLanes{})
++    GdnLanes gl{};
++    gl.first_snapshot = first_snapshot;
++    gl.compact_snapshot = compact_snapshot;
++#define FNX_GDN(t) k_gdn_core<t><<<nv * GDN_Q, GDN_THREADS, 0, s>>>(qkvz, ab, hist, convw, dt, a, nw, S, y, ctl, scratch, snap, hsnap, nk, nv, vmap, eps, tq, td, y32, gl)
+     switch (T) {
+         case 1: FNX_GDN(1); break;
+         case 2: FNX_GDN(2); break;
+@@ -1899,7 +2034,21 @@ void router_route(const float* W, const float* x, float* logits, int T, int* top
+     unsigned* counter = (unsigned*) (njobs + 1);
+     const ExpertCache none{};
+     if (ec && (layer < 0 || layer >= NL || !list)) throw std::runtime_error("router_route: a cache plan needs its layer and list");
+-#define FNX_RR(t) k_router_route<t><<<grid, RR_THREADS, 0, s>>>(W, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, ec ? *ec : none, layer, list, su)
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++    static const bool fast_hits = env_flag("FNX_RM400_CACHE_ALL_HIT");
++    static const bool fast_winner = env_flag("FNX_RM400_ROUTER_FAST_WINNER");
++#else
++    constexpr bool fast_hits = false;
++    constexpr bool fast_winner = false;
++#endif
++    auto launch = [&](auto tag) {
++        constexpr int TT = decltype(tag)::value;
++        if (fast_winner)
++            k_router_route<TT, true><<<grid, RR_THREADS, 0, s>>>(W, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, ec ? *ec : none, layer, list, su, fast_hits);
++        else
++            k_router_route<TT><<<grid, RR_THREADS, 0, s>>>(W, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, ec ? *ec : none, layer, list, su, fast_hits);
++    };
++#define FNX_RR(t) launch(std::integral_constant<int, t>{})
+     switch (T) {
+         case 1: FNX_RR(1); break;
+         case 2: FNX_RR(2); break;
+@@ -1927,14 +2076,14 @@ void router_route(const float* W, const float* x, float* logits, int T, int* top
+ #if FNX_KPART == 2
+ namespace {
+ void moe_mm(bool down, const DW& A, size_t sa, const Job* jobs, const int* njobs, int njobs_max, const void* in, void* out,
+-            void* st, int tt = 0) {
++            void* st, int tt = 0, const int16_t* q4k_sums = nullptr) {
+     const int T = tt ? tt : njobs_max / TOPK;   // the most rows a job has
+     const MoeW w{(const char*) A.p, sa, A.row_bytes, A.n_out, A.n_in, A.ep};
+     cudaStream_t s = (cudaStream_t) st;
+     switch (A.type) {
+         case T_Q4_K:
+             if (down) moe_launch<GGML_TYPE_Q4_K>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T);
+-            else gu_q4k_launch(T, w, jobs, njobs, njobs_max, (const block_q8_1*) in, (float*) out, s);
++            else gu_q4k_launch(T, w, jobs, njobs, njobs_max, (const block_q8_1*) in, (float*) out, s, {}, q4k_sums);
+             break;
+         case T_Q5_K: moe_launch<GGML_TYPE_Q5_K>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
+         case T_Q5_1: moe_launch<GGML_TYPE_Q5_1>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
+@@ -1964,9 +2113,9 @@ __global__ void k_swiglu_stacked(const float* gu, block_q8_1* hq, int ffs, int8_
+ }  // namespace
+ 
+ void moe_gate_up(const DW& A, size_t sa, const Job* jobs, const int* njobs, int njobs_max, const void* xq, float* gu, void* st,
+-                 const Q8S* sh_down, int sh_ffs, const float* sh_gu, float* sh_out) {
++                 const Q8S* sh_down, int sh_ffs, const float* sh_gu, float* sh_out, const int16_t* q4k_sums) {
+     if (!sh_down) {
+-        moe_mm(false, A, sa, jobs, njobs, njobs_max, xq, gu, st);
++        moe_mm(false, A, sa, jobs, njobs, njobs_max, xq, gu, st, 0, q4k_sums);
+         return;
+     }
+     if (A.type != T_Q4_K) throw std::runtime_error("moe_gate_up: the shared expert rides only in the Q4_K experts' launch");
+@@ -1975,7 +2124,7 @@ void moe_gate_up(const DW& A, size_t sa, const Job* jobs, const int* njobs, int
+     for (int k = 0; k < Q8S_SEGS; ++k) sd.w.q[k] = sh_down->q, sd.w.d[k] = sh_down->d, sd.w.out[k] = sh_out, sd.w.end[k] = N, sd.w.stride[k] = N;
+     sd.rows = N, sd.ffs = sh_ffs, sd.gu = sh_gu;
+     const MoeW w{(const char*) A.p, sa, A.row_bytes, A.n_out, A.n_in, A.ep};
+-    gu_q4k_launch(njobs_max / TOPK, w, jobs, njobs, njobs_max, (const block_q8_1*) xq, gu, (cudaStream_t) st, sd);
++    gu_q4k_launch(njobs_max / TOPK, w, jobs, njobs, njobs_max, (const block_q8_1*) xq, gu, (cudaStream_t) st, sd, q4k_sums);
+     ck_launch("moe_gate_up (with the shared expert)");
+ }
+ namespace {
+@@ -2031,6 +2180,20 @@ namespace {
+ template <int R, bool SPLIT, bool SEG>
+ void q8s_launch(const Q8Segs& g, int rows, int cols, const block_q8_1* y, const int8_t* tq, const float* td, int T, cudaStream_t s) {
+     const dim3 grid((rows + Q8S_THREADS / 32 * R - 1) / (Q8S_THREADS / 32 * R));
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++    if constexpr (R == 4) {
++        static const bool tile2 = env_flag("FNX_RM400_Q8S_TILE2");
++        if (tile2) {
++#define FNX_TILE2(t) case t: k_q8s<t, R, SPLIT, SEG, 2><<<grid, Q8S_THREADS, 0, s>>>(g, rows, cols, y, tq, td); return
++            switch (T) {
++                FNX_TILE2(6);
++                FNX_TILE2(7);
++                FNX_TILE2(8);
++            }
++#undef FNX_TILE2
++        }
++    }
++#endif
+ #define FNX_Q8S(t) k_q8s<t, R, SPLIT, SEG><<<grid, Q8S_THREADS, 0, s>>>(g, rows, cols, y, tq, td)
+     switch (T) {
+         case 1: FNX_Q8S(1); break;
+@@ -2080,6 +2243,12 @@ void q8s_run(const Q8Segs& g, int rows, int cols, const void* y, int T, void* st
+         else if (rows >= 8192) q8s_launch<4, SEG>(g, rows, cols, yq, T, s);
+ #else
+         if (rows >= 8192) q8s_launch<4, SEG>(g, rows, cols, yq, T, s);
++#endif
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++        // 2026-11-18: mid-size recurrent and output projections have
++        // enough CTAs to test reusing each activation across two rows.
++        else if (rows >= 2048 && T >= 3 && T <= 8 && env_flag("FNX_RM400_Q8S_MID_TILE"))
++            q8s_launch<2, SEG>(g, rows, cols, yq, T, s);
+ #endif
+         else if (rows >= 4096) q8s_launch<2, SEG>(g, rows, cols, yq, T, s);
+         else q8s_launch<1, SEG>(g, rows, cols, yq, T, s);
+@@ -2114,6 +2283,20 @@ template <int R, bool SPLIT>
+ void q8s_ab_launch(const Q8Segs& g, int rows, int cols, const block_q8_1* y, const int8_t* tq, const float* td, const float* W,
+                    const float* x, float* yf, int rf, int T, cudaStream_t s) {
+     const dim3 grid(rf + (rows + Q8S_THREADS / 32 * R - 1) / (Q8S_THREADS / 32 * R));
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++    if constexpr (R == 2) {
++        static const bool tile2 = env_flag("FNX_RM400_Q8S_AB_TILE2");
++        if (tile2) {
++#define FNX_TILE2(t) case t: k_q8s_ab<t, R, SPLIT, 2><<<grid, Q8S_THREADS, 0, s>>>(g, rows, cols, y, tq, td, W, x, yf, rf); return
++            switch (T) {
++                FNX_TILE2(6);
++                FNX_TILE2(7);
++                FNX_TILE2(8);
++            }
++#undef FNX_TILE2
++        }
++    }
++#endif
+ #define FNX_QA(t) k_q8s_ab<t, R, SPLIT><<<grid, Q8S_THREADS, 0, s>>>(g, rows, cols, y, tq, td, W, x, yf, rf)
+     switch (T) {
+         case 1: FNX_QA(1); break;
+diff --git a/src/kernels.hpp b/src/kernels.hpp
+index ddb3d52..1fc43c8 100644
+--- a/src/kernels.hpp
++++ b/src/kernels.hpp
+@@ -63,7 +63,7 @@ int hc_prepare(float* scratch, int cap = 0);
+ int hc1_rows();   // FNX_HC1: windows of up to this many rows take the read's one-barrier form (read once; throws if bad)
+ void hc_read(float* R, const float* bo_prev, const float* inj_prev, const float* w_norm, const Q8S& w_down,
+              const Q8S& w_up, const uint16_t* w_inj, float eps, float* mixed, float* inject, float* scratch, unsigned* err,
+-             int T, void* st, void* q8 = nullptr);
++             int T, void* st, void* q8 = nullptr, int16_t* q4k_sums = nullptr);
+ // sets the barrier counter in an hc scratch so that it wraps after barriers_left more barriers (2 per read): a test
+ // of the wrap (FNX_HC_BAR_WRAP)
+ void hc_preset_barrier(float* scratch, unsigned barriers_left);
+@@ -90,7 +90,8 @@ void gdn_out_norm(const float* o, const float* z, const float* w, float* y, int
+ size_t gdn_scratch_floats(int nv);
+ void gdn_core(const float* qkvz, const float* ab, float* hist, const float* convw, const float* dt, const float* a,
+               const float* nw, float* S, void* yq, const int* ctl, float* scratch, float* snap, float* hsnap, int nk, int nv,
+-              const int* vmap, int T, float eps, void* st, float* y32 = nullptr);
++              const int* vmap, int T, float eps, void* st, float* y32 = nullptr, bool first_snapshot = false,
++              bool compact_snapshot = false);
+ // a batched window's T rows, one row each from a lane of its own: device arrays of row r's lane's state, conv history
+ // (this layer's) and ctl. With row0: segments of several rows of one lane, indexed by segment, segment s's rows from
+ // window row row0[s] (device), its snapshots (snap and hsnap as gdn_core's, this layer's) from that row on
+@@ -101,6 +102,8 @@ struct GdnLanes {
+     const int* row0 = nullptr;
+     float* snap = nullptr;
+     float* hsnap = nullptr;
++    bool first_snapshot = false;
++    bool compact_snapshot = false;
+ };
+ // gdn_core over those rows at once (qkvz, ab and yq rows by window row; no cut-back snapshots: one row per lane)
+ void gdn_core_lanes(const float* qkvz, const float* ab, const float* convw, const float* dt, const float* a, const float* nw, void* yq,
+@@ -185,6 +188,14 @@ struct LaneRows {
+     const int* const* pos = nullptr;
+     const int* const* pt = nullptr;
+ };
++// Decode graph arguments copied at capture, not uploaded every step.
++// Positions and page tables remain indirect, as in LaneRows.
++struct LaneAttPrep {
++    LaneRows rows;
++    const int* rot[MAXT] = {};
++    uint16_t* ring[MAXT] = {};
++    uint8_t first[MAXT] = {};  // first window row of each lane's segment
++};
+ #ifdef __CUDACC__
+ __device__ __forceinline__ int row_pos(const LaneRows& lr, const int* pos0, int t) { return lr.pos ? *lr.pos[t] : *pos0 + t; }
+ __device__ __forceinline__ KvPages row_pages(KvPages g, const LaneRows& lr, int t) {
+@@ -204,6 +215,8 @@ void set_prompt_rows(int rows);
+ // the indexer's per-row steps alone, for rows already projected (y): the query, the raw keys, the completed blocks
+ void qsa_index(const float* y, const float* qn, const float* kn, uint16_t* ring, uint16_t* pooled, const KvPages& g, float* q, const int* pos0, int T,
+                float eps, Rope base, void* st);
++void qsa_index_lanes(const float* y, const float* qn, const float* kn, uint16_t* pooled, const KvPages& g, float* q,
++                     const LaneAttPrep& prep, int T, float eps, Rope base, void* st);
+ // the scores and the selection of rows whose query is in q
+ void qsa_select(const float* q, const uint16_t* pooled, const KvPages& g, float* scores, int* cells, int* n_cells, int max_pools, const int* pos0, int T,
+                 int card, void* st);
+@@ -250,6 +263,8 @@ void kv_append(const float* k, const float* v, uint16_t* kc, uint16_t* vc, const
+ // attn_prep (NQH, NKVH) and kv_append in one launch, the same values
+ void attn_prep_append(float* qg, float* k, const float* v, const float* q_norm, const float* k_norm, uint16_t* kc, uint16_t* vc,
+                       const KvPages& g, int card, int T, const int* pos0, float eps, Rope base, void* st);
++void attn_prep_append_lanes(float* qg, float* k, const float* v, const float* qn, const float* kn, uint16_t* kc, uint16_t* vc,
++                            const KvPages& g, const LaneAttPrep& prep, int card, int T, float eps, Rope base, void* st);
+ // cnt[e] += how many of the n picks in topi are expert e (FNX_ROUTE_COUNT's tallies)
+ void route_count(const int* topi, int n, unsigned* cnt, void* st);
+ // FNX_PREFETCH_PROBE: guess = the top 10 of T rows of NEXP logits; score: cnt[0..6] += the window's distinct experts
+@@ -279,7 +294,8 @@ void router_route(const float* W, const float* x, float* logits, int T, int* top
+ // gu rows of 2*ffs: [gate | up] (A: per-expert stacked rows, stride sa). sh_down (Q4_K experts only): the shared
+ // expert's swiglu of sh_gu ([T][2 * sh_ffs]) and down (N rows) into sh_out (row stride N), in the same launch
+ void moe_gate_up(const DW& A, size_t sa, const Job* jobs, const int* njobs, int njobs_max, const void* xq, float* gu, void* st,
+-                 const Q8S* sh_down = nullptr, int sh_ffs = 0, const float* sh_gu = nullptr, float* sh_out = nullptr);
++                 const Q8S* sh_down = nullptr, int sh_ffs = 0, const float* sh_gu = nullptr, float* sh_out = nullptr,
++                 const int16_t* q4k_sums = nullptr);
+ // the same for jobs of up to MAXT rows each, njobs_cap of them at most (the prompt path's)
+ void moe_gate_up_jobs(const DW& A, size_t sa, const Job* jobs, const int* njobs, int njobs_cap, const void* xq, float* gu, void* st);
+ // the same with BigJobs (njobs_cap of them at most)
+@@ -376,8 +392,11 @@ struct CopyJob {
+     void* dst;
+     const void* src;
+     size_t bytes;
++    int replay_keep = 0, replay_heads = 0;  // nonzero for compact recurrent state jobs only
+ };
+ void copy_many(const CopyJob* jobs, int n, void* st);
++// As copy_many; a tagged state job replays its own accepted prefix.
++void replay_gdn_many(const CopyJob* jobs, int n, void* st);
+ 
+ // argmax over this card's vocab slice: best[t] = (value, index + v0). keys: MAXT words, zeroed once (left at zero).
+ // err bit 16: a logit was NaN or inf
+diff --git a/src/moe.cuh b/src/moe.cuh
+index 703cfdb..173cd43 100644
+--- a/src/moe.cuh
++++ b/src/moe.cuh
+@@ -16,7 +16,8 @@ constexpr int RR_THREADS = 256, RR_WPR = 2, RR_ROWS = RR_THREADS / 32 / RR_WPR;
+ // slot of the layer's pool that the pool's CLOCK hand reaches first with ref 0 (a ref 1 it passes drops to 0), its old
+ // expert pointing back at RAM. The hand goes round the pool's slots past its lent ones. list: how many took a slot,
+ // then their ids
+-__device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache& ec, int* list) {
++__device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache& ec, int* list,
++                           bool fast_hits) {
+     const int lane = threadIdx.x & 31, base = layer * NEXP, p = ec.pool_of[layer], lent = ec.lent[p];
+     // an arena's pools hold every expert until it lends, and then only its own pool's experts can be missing
+     if (ec.arena_full && (p != ec.arena_pool || lent == 0)) {
+@@ -24,6 +25,25 @@ __device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache
+         return;
+     }
+     const int s0 = ec.s0[p] + lent, n = ec.n[p] - lent;
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++    // 2026-11-19: keep up to two job slots per lane. With no misses,
++    // omit the transient ref=2 pin but preserve CLOCK normalization.
++    if (fast_hits && nj <= 64) {
++        const int slot0 = lane < nj ? ec.slot_of[base + jobs[lane].w] : -1;
++        const int slot1 = lane + 32 < nj ? ec.slot_of[base + jobs[lane + 32].w] : -1;
++        const bool miss = (lane < nj && slot0 < 0) || (lane + 32 < nj && slot1 < 0);
++        if (!__any_sync(0xffffffffu, miss)) {
++            if (slot0 >= 0) ec.ref[slot0] = 1;
++            if (slot1 >= 0) ec.ref[slot1] = 1;
++            if (lane == 0) {
++                const int hand = ec.hand[p] - s0;
++                ec.hand[p] = s0 + ((hand < 0 || hand >= n) ? 0 : hand);
++                list[0] = 0;
++            }
++            return;
++        }
++    }
++#endif
+     for (int j = lane; j < nj; j += 32)
+         if (const int s = ec.slot_of[base + jobs[j].w]; s >= 0) ec.ref[s] = 2;
+     __syncwarp();
+@@ -70,12 +90,12 @@ __device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache
+     }
+ }
+ 
+-template <int T>
++template <int T, bool FAST_WINNER = false>
+ __global__ void __launch_bounds__(RR_THREADS) k_router_route(const float* __restrict__ W, const float* __restrict__ x,
+                                                             float* __restrict__ logits, int* __restrict__ topi,
+                                                             float* __restrict__ topw, Job* __restrict__ gu, Job* __restrict__ dn,
+                                                             int* __restrict__ njobs, unsigned* __restrict__ counter,
+-                                                            const ExpertCache ec, int layer, int* list, const ShexpUp su) {
++                                                            const ExpertCache ec, int layer, int* list, const ShexpUp su, bool fast_hits) {
+     static_assert(RR_THREADS == Q8S_THREADS, "the shared expert's q8s blocks in the router's launch");
+     constexpr int NC = N / 4 / 32 / RR_WPR, L = NEXP + 1;   // float4 chunks per lane
+     const int nrr = (int) gridDim.x - su.blocks;              // the router's own blocks; the shared expert's after them
+@@ -142,11 +162,28 @@ __global__ void __launch_bounds__(RR_THREADS) k_router_route(const float* __rest
+ #pragma unroll
+             for (int i = 0; i < NEXP / 32; ++i)
+                 if (!(taken >> i & 1u) && v[i] > bv) { bv = v[i]; bi = lane + 32 * i; }
++            if constexpr (FAST_WINNER) {
++                // 2026-11-19: the usual unique maximum needs one float
++                // reduction and one indexed exchange, not a pair of
++                // shuffles for each reduction stage.
++                const float mx = wmax(bv);
++                const unsigned same = __ballot_sync(0xffffffffu, bv == mx);
++                int winner = __ffs(same) - 1;
++                if (same & (same - 1u)) {
++                    int id = bv == mx ? bi : NEXP;
+ #pragma unroll
+-            for (int o = 16; o; o >>= 1) {
+-                const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+-                const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+-                if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
++                    for (int o = 16; o; o >>= 1) id = min(id, __shfl_xor_sync(0xffffffffu, id, o));
++                    winner = id & 31;
++                }
++                bv = __shfl_sync(0xffffffffu, bv, winner);
++                bi = __shfl_sync(0xffffffffu, bi, winner);
++            } else {
++#pragma unroll
++                for (int o = 16; o; o >>= 1) {
++                    const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
++                    const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
++                    if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
++                }
+             }
+             if ((bi & 31) == lane) taken |= 1u << (bi >> 5);
+             if (k == 0) top0 = bv;
+@@ -165,7 +202,10 @@ __global__ void __launch_bounds__(RR_THREADS) k_router_route(const float* __rest
+     // its expert's job (the order of a job's rows does not matter)
+     constexpr int P = T * TOPK;
+     __shared__ int firstpair[NEXP], slots[NEXP], jobof[NEXP];
+-    __shared__ unsigned char first[MAXT * TOPK];
++    // 2026-11-18: compact first picks in pair order using one ballot
++    // per warp, rather than rescanning the preceding pairs per first pick.
++    constexpr int NW = (P + 31) / 32;
++    __shared__ unsigned warp_count[NW];
+     for (int x2 = e; x2 < NEXP; x2 += RR_THREADS) {
+         firstpair[x2] = P;
+         slots[x2] = 0;
+@@ -173,11 +213,13 @@ __global__ void __launch_bounds__(RR_THREADS) k_router_route(const float* __rest
+     __syncthreads();
+     if (e < P) atomicMin(&firstpair[ex[e]], e);
+     __syncthreads();
+-    if (e < P) first[e] = firstpair[ex[e]] == e;
++    const bool first = e < P && firstpair[ex[e]] == e;
++    const unsigned mask = __ballot_sync(0xffffffffu, first);
++    if (lane == 0 && warp < NW) warp_count[warp] = __popc(mask);
+     __syncthreads();
+-    if (e < P && first[e]) {
+-        int j = 0;
+-        for (int q = 0; q < e; ++q) j += first[q];
++    if (first) {
++        int j = __popc(mask & ((1u << lane) - 1u));
++        for (int q = 0; q < warp; ++q) j += warp_count[q];
+         jobof[ex[e]] = j;
+         gu[j].w = dn[j].w = ex[e];
+     }
+@@ -188,17 +230,18 @@ __global__ void __launch_bounds__(RR_THREADS) k_router_route(const float* __rest
+         gu[j].out[s] = dn[j].y[s] = dn[j].out[s] = e;
+     }
+     __syncthreads();
+-    if (e < P && first[e]) gu[jobof[ex[e]]].n = dn[jobof[ex[e]]].n = slots[ex[e]];
++    if (first) gu[jobof[ex[e]]].n = dn[jobof[ex[e]]].n = slots[ex[e]];
+     __shared__ int nj;
+     if (e == P) {
+         int n = 0;
+-        for (int q = 0; q < P; ++q) n += first[q];
++#pragma unroll
++        for (int q = 0; q < NW; ++q) n += warp_count[q];
+         njobs[0] = nj = n;
+         *counter = 0u;
+     }
+     if (!ec.n_slots) return;
+     __syncthreads();
+-    if (warp == 0) cache_plan(gu, nj, layer, ec, list);
++    if (warp == 0) cache_plan(gu, nj, layer, ec, list, fast_hits);
+ }
+ 
+ // rows of one job: tmp[j] = W row . y[ys[j]] for j < n <= TT, G lanes per row
+@@ -294,9 +337,57 @@ __global__ void k_moe_h(const float* __restrict__ gu, int ffs, int npairs) {
+     if (lane == 0) h.ds = make_half2(__float2half(d), __float2half(sm));
+ }
+ 
++// 2026-11-19: unpack a Q5_1 weight block once, not once per token.
++// Keep the two groups of four DP4As and their separately rounded
++// scale/min terms in the same order as llama.cpp's MMVQ implementation.
++struct DownQ5 {
++    half2 dm;
++    int lo[4], hi[4];
++};
++
++__device__ __forceinline__ DownQ5 read_down_q5(const block_q5_1& w) {
++    DownQ5 p;
++    p.dm = w.dm;
++    const unsigned high = (unsigned) get_int_b4(w.qh, 0);
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++        const unsigned low = (unsigned) get_int_b4(w.qs, i), h = high >> (4 * i);
++        p.lo[i] = (low & 0x0f0f0f0fu) | ((h << 4) & 0x00000010u) | ((h << 11) & 0x00001000u) |
++                  ((h << 18) & 0x00100000u) | ((h << 25) & 0x10000000u);
++        p.hi[i] = ((low >> 4) & 0x0f0f0f0fu) | ((h >> 12) & 0x00000010u) | ((h >> 5) & 0x00001000u) |
++                  ((h << 2) & 0x00100000u) | ((h << 9) & 0x10000000u);
++    }
++    return p;
++}
++
++template <int FIRST>
++__device__ __forceinline__ float down_q5_half(const DownQ5& p, const block_q8_1& x, float d, float m) {
++    int dots = 0;
++#pragma unroll
++    for (int i = FIRST; i < FIRST + VDR_Q5_1_Q8_1_MMVQ; ++i) {
++        dots = ggml_cuda_dp4a(p.lo[i], get_int_b4(x.qs, i), dots);
++        dots = ggml_cuda_dp4a(p.hi[i], get_int_b4(x.qs, i + QI5_1), dots);
++    }
++    return dots * d + m / (QI5_1 / VDR_Q5_1_Q8_1_MMVQ);
++}
++
++__device__ __forceinline__ float down_q5_dot(const DownQ5& p, const block_q8_1& x) {
++    static_assert(QI5_1 == 4 && VDR_Q5_1_Q8_1_MMVQ == 2);
++#ifdef FAST_FP16_AVAILABLE
++    const float2 dm = __half22float2(__hmul2(p.dm, x.ds));
++#else
++    const float2 w = __half22float2(p.dm), a = __half22float2(x.ds);
++    const float2 dm = make_float2(w.x * a.x, w.y * a.y);
++#endif
++    float s = 0.f;
++    s += down_q5_half<0>(p, x, dm.x, dm.y);
++    s += down_q5_half<2>(p, x, dm.x, dm.y);
++    return s;
++}
++
+ // PRE: the pairs' h made by k_moe_h (past 8 rows: kbench 16 rows 82.9 -> 70.7 us); else each block makes its own (the
+ // extra launch costs more than it saves: 5 rows 30.7 -> 31.7)
+-template <ggml_type TA, bool PRE>
++template <ggml_type TA, bool PRE, bool UNPACK_Q5 = false, int NB = 0>
+ __global__ void __launch_bounds__(DN_THREADS) k_moe_down(MoeW w, const Job* __restrict__ jobs, const int* __restrict__ njobs,
+                                                         const float* __restrict__ gu, float* __restrict__ out) {
+     const int ji = blockIdx.y;
+@@ -307,7 +398,11 @@ __global__ void __launch_bounds__(DN_THREADS) k_moe_down(MoeW w, const Job* __re
+     float(*part)[DN_THREADS] = reinterpret_cast<float(*)[DN_THREADS]>(dn_part);   // blocks an SM holds
+     if (threadIdx.x == 0) jb = jobs[ji];
+     __syncthreads();
+-    const int ffs = w.ncols, nb = ffs / DN_U, n = jb.n;
++    // 2026-11-19: derive integer divisors and the output reduction length
++    // from the two actual V100 shard sizes. Keep block and row ownership.
++    static_assert(NB == 0 || (UNPACK_Q5 && !PRE && (NB == 6 || NB == 7)));
++    const int ffs = NB ? NB * DN_U : w.ncols;
++    const int nb = NB ? NB : ffs / DN_U, n = jb.n;
+     if constexpr (PRE) {
+         static_assert(sizeof(block_q8_1) == 36, "a q8_1 block is 9 words");
+         for (int q = threadIdx.x; q < n * nb * 9; q += DN_THREADS) {
+@@ -332,14 +427,28 @@ __global__ void __launch_bounds__(DN_THREADS) k_moe_down(MoeW w, const Job* __re
+     const bool live = r < rpb && row < w.nrows;
+     if (live) {
+         const char* wr = moe_expert(w, jb.w) + (size_t) row * w.row_a;
+-        for (int j = 0; j < n; ++j) part[j][threadIdx.x] = unit_dot<TA, DN_U>(wr, u, hq[j]);
++        if constexpr (UNPACK_Q5) {
++            static_assert(TA == GGML_TYPE_Q5_1);
++            const DownQ5 p = read_down_q5(reinterpret_cast<const block_q5_1*>(wr)[u]);
++            asm volatile("" ::: "memory"); // keep weight unpack outside the token loop
++#pragma unroll 1
++            for (int j = 0; j < n; ++j) part[j][threadIdx.x] = down_q5_dot(p, hq[j][u]);
++        } else {
++            for (int j = 0; j < n; ++j) part[j][threadIdx.x] = unit_dot<TA, DN_U>(wr, u, hq[j]);
++        }
+     }
+     __syncthreads();
+     for (int e = threadIdx.x; e < n * rpb; e += DN_THREADS) {
+         const int j = e / rpb, rr = e % rpb, orow = blockIdx.x * rpb + rr;
+         if (orow >= w.nrows) continue;
+         float s = 0.f;
+-        for (int k = 0; k < nb; ++k) s += part[j][rr * nb + k];
++        if constexpr (NB) {
++            // Preserve the serial addition order and the initial +0.
++#pragma unroll
++            for (int k = 0; k < NB; ++k) s += part[j][rr * NB + k];
++        } else {
++            for (int k = 0; k < nb; ++k) s += part[j][rr * nb + k];
++        }
+         out[(size_t) jb.out[j] * w.nrows + orow] = s;
+     }
+ }
+@@ -480,6 +589,26 @@ void moe_launch(bool down, const MoeW& w, const Job* jobs, const int* njobs, int
+             k_moe_h<<<(nh + 7) / 8, 256, 0, s>>>((const float*) in, w.ncols, njobs_max);
+             k_moe_down<TA, true><<<grid, DN_THREADS, smem, s>>>(w, jobs, njobs, (const float*) in, out);
+         } else {
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++            if constexpr (TA == GGML_TYPE_Q5_1) {
++                static const bool unpack = env_flag("FNX_RM400_Q5_DOWN_UNPACK_ONCE");
++                if (unpack && T >= 4 && w.nrows == N && (w.ncols == 192 || w.ncols == 224)) {
++                    static const bool fixed_shape = env_flag("FNX_RM400_Q5_DOWN_FIXED_SHAPE");
++                    if (fixed_shape) {
++                        if (w.ncols == 192)
++                            k_moe_down<TA, false, true, 6><<<grid, DN_THREADS, smem, s>>>(
++                                w, jobs, njobs, (const float*) in, out);
++                        else
++                            k_moe_down<TA, false, true, 7><<<grid, DN_THREADS, smem, s>>>(
++                                w, jobs, njobs, (const float*) in, out);
++                        return;
++                    }
++                    k_moe_down<TA, false, true><<<grid, DN_THREADS, smem, s>>>(
++                        w, jobs, njobs, (const float*) in, out);
++                    return;
++                }
++            }
++#endif
+             k_moe_down<TA, false><<<grid, DN_THREADS, smem, s>>>(w, jobs, njobs, (const float*) in, out);
+         }
+         return;
+diff --git a/src/moe_q4k.cuh b/src/moe_q4k.cuh
+index fa43435..63af184 100644
+--- a/src/moe_q4k.cuh
++++ b/src/moe_q4k.cuh
+@@ -26,10 +26,19 @@ __device__ __forceinline__ void q4k_scale_min(const uint4& h, int j, float& sc,
+ constexpr int Q4K_GPL = N / 64 / Q4K_LPR;
+ static_assert(N % (64 * Q4K_LPR) == 0, "groups per lane");
+ 
++// 2026-11-18: use vector members directly. Treating local int4 arrays as
++// scalar pointers forced stack loads/stores in nvcc's sm_70 gate/up code.
++__device__ __forceinline__ int q4k_dot4(unsigned w0, unsigned w1, unsigned w2, unsigned w3, int4 x, int acc) {
++    acc = __dp4a((int) w0, x.x, acc);
++    acc = __dp4a((int) w1, x.y, acc);
++    acc = __dp4a((int) w2, x.z, acc);
++    return __dp4a((int) w3, x.w, acc);
++}
++
+ // the lane's groups [I0, I1): their weights loaded together, then each token's dots in group order
+-template <int I0, int I1>
++template <int I0, int I1, bool CACHE_SUMS, bool TWIN, bool PRODUCER_SUMS>
+ __device__ __forceinline__ void q4k_groups(const char* wrow, int lane8, int n, const block_q8_1* y, const int* ys, int y_stride,
+-                                           float* tmp) {
++                                           float* tmp, const int16_t* sums, const int8_t* tq, const float* td) {
+     constexpr int G = I1 - I0;
+     uint4 hdr[G], q0[G], q1[G];
+ #pragma unroll
+@@ -54,21 +63,42 @@ __device__ __forceinline__ void q4k_groups(const char* wrow, int lane8, int n, c
+         // instruction cache it is fetched into cold at every launch
+ #pragma unroll 1
+         for (int j = 0; j < n; ++j) {
+-            const block_q8_1* yb = y + (size_t) ys[j] * y_stride + b * 8 + jg * 2;
+-            // q8_1 blocks are 36 bytes with qs at offset 4: 4-byte loads
+-            const int* a0 = reinterpret_cast<const int*>(yb[0].qs);
+-            const int* a1 = reinterpret_cast<const int*>(yb[1].qs);
++            const size_t yoff = (size_t) ys[j] * y_stride + b * 8 + jg * 2;
++            const block_q8_1* yb = y + yoff;
+             int dl = 0, dh = 0, sl = 0, sh = 0;
++            if constexpr (TWIN) {
++                static_assert(CACHE_SUMS, "twin path uses the cached exact sums");
++                const int4* av = reinterpret_cast<const int4*>(tq + yoff * 32);
++#pragma unroll
++                for (int v = 0; v < 2; ++v) {
++                    const uint4 w = v ? q1[ii] : q0[ii];
++                    constexpr unsigned mask = 0x0f0f0f0fu;
++                    dl = q4k_dot4(w.x & mask, w.y & mask, w.z & mask, w.w & mask, av[v], dl);
++                    dh = q4k_dot4((w.x >> 4) & mask, (w.y >> 4) & mask, (w.z >> 4) & mask, (w.w >> 4) & mask,
++                                  av[2 + v], dh);
++                }
++            } else {
++                const int* a0 = reinterpret_cast<const int*>(yb[0].qs);
++                const int* a1 = reinterpret_cast<const int*>(yb[1].qs);
+ #pragma unroll
+-            for (int w = 0; w < 8; ++w) {
+-                const unsigned q = qw[w];
+-                const int al = a0[w], ah = a1[w];
+-                dl = __dp4a((int) (q & 0x0F0F0F0Fu), al, dl);
+-                dh = __dp4a((int) ((q >> 4) & 0x0F0F0F0Fu), ah, dh);
+-                sl = __dp4a(0x01010101, al, sl);
+-                sh = __dp4a(0x01010101, ah, sh);
++                for (int w = 0; w < 8; ++w) {
++                    const unsigned q = qw[w];
++                    const int al = a0[w], ah = a1[w];
++                    dl = __dp4a((int) (q & 0x0F0F0F0Fu), al, dl);
++                    dh = __dp4a((int) ((q >> 4) & 0x0F0F0F0Fu), ah, dh);
++                    if constexpr (!CACHE_SUMS) {
++                        sl = __dp4a(0x01010101, al, sl);
++                        sh = __dp4a(0x01010101, ah, sh);
++                    }
++                }
+             }
+-            const float d8l = __low2float(yb[0].ds), d8h = __low2float(yb[1].ds);
++            if constexpr (CACHE_SUMS) {
++                const size_t off = PRODUCER_SUMS ? yoff : j * (N / 32) + b * 8 + jg * 2;
++                sl = sums[off];
++                sh = sums[off + 1];
++            }
++            const float d8l = TWIN ? td[yoff] : __low2float(yb[0].ds);
++            const float d8h = TWIN ? td[yoff + 1] : __low2float(yb[1].ds);
+             tmp[j] += d * (d8l * (sc0 * (float) dl) + d8h * (sc1 * (float) dh)) - dmin * (d8l * (m0 * (float) sl) + d8h * (m1 * (float) sh));
+         }
+     }
+@@ -76,24 +106,37 @@ __device__ __forceinline__ void q4k_groups(const char* wrow, int lane8, int n, c
+ 
+ // the lane's groups in two passes, the second's loads after the first's dots (a compiler barrier between): all five
+ // held at once took the registers of 3 blocks an SM. Each token's sum takes the groups in the same order
+-template <int TT>
++template <int TT, bool CACHE_SUMS = false, bool TWIN = false, bool PRODUCER_SUMS = false, bool SHORT_GROUPS = false>
+ __device__ __forceinline__ void q4k_row(const char* wrow, int lane8, int n, const block_q8_1* y, const int* ys, int y_stride,
+-                                        float* tmp) {
+-    constexpr int SPLIT = (Q4K_GPL + 1) / 2;
+-    q4k_groups<0, SPLIT>(wrow, lane8, n, y, ys, y_stride, tmp);
+-    asm volatile("" ::: "memory");
+-    q4k_groups<SPLIT, Q4K_GPL>(wrow, lane8, n, y, ys, y_stride, tmp);
++                                        float* tmp, const int16_t* sums = nullptr, const int8_t* tq = nullptr,
++                                        const float* td = nullptr) {
++    // 2026-11-19: shorten the live ranges of the loaded weights on SM70.
++    // This changes neither the group order nor the floating-point expression.
++    if constexpr (SHORT_GROUPS && Q4K_GPL == 5) {
++        q4k_groups<0, 2, CACHE_SUMS, TWIN, PRODUCER_SUMS>(wrow, lane8, n, y, ys, y_stride, tmp, sums, tq, td);
++        asm volatile("" ::: "memory");
++        q4k_groups<2, 4, CACHE_SUMS, TWIN, PRODUCER_SUMS>(wrow, lane8, n, y, ys, y_stride, tmp, sums, tq, td);
++        asm volatile("" ::: "memory");
++        q4k_groups<4, 5, CACHE_SUMS, TWIN, PRODUCER_SUMS>(wrow, lane8, n, y, ys, y_stride, tmp, sums, tq, td);
++    } else {
++        constexpr int SPLIT = (Q4K_GPL + 1) / 2;
++        q4k_groups<0, SPLIT, CACHE_SUMS, TWIN, PRODUCER_SUMS>(wrow, lane8, n, y, ys, y_stride, tmp, sums, tq, td);
++        asm volatile("" ::: "memory");
++        q4k_groups<SPLIT, Q4K_GPL, CACHE_SUMS, TWIN, PRODUCER_SUMS>(wrow, lane8, n, y, ys, y_stride, tmp, sums, tq, td);
++    }
+ }
+ 
+ // sd.rows: the launch's first sd_rows rows of blocks make the shared expert's swiglu and down, a q8s block or two each
+ // (one row of 14 blocks doing ~23 each took the launch 34 -> 61 us); first, so they start first (TT: the window's rows)
+-template <int TT>
+-__global__ void __launch_bounds__(Q4K_THREADS) k_moe_gu_q4k(MoeW w, const Job* __restrict__ jobs, const int* __restrict__ njobs,
++template <int TT, bool TWIN = false, bool PRODUCER_SUMS = false, bool SHORT_GROUPS = false, bool SINGLE_JOB = false,
++          int THREADS = Q4K_THREADS>
++__global__ void __launch_bounds__(THREADS) k_moe_gu_q4k(MoeW w, const Job* __restrict__ jobs, const int* __restrict__ njobs,
+                                                           const block_q8_1* __restrict__ y, float* __restrict__ out, const ShexpDown sd,
+-                                                          int sd_rows) {
+-    static_assert(Q4K_THREADS == Q8S_THREADS, "the shared expert's q8s blocks in the gate|up launch");
++                                                          int sd_rows, const int8_t* __restrict__ tq, const float* __restrict__ td,
++                                                          const int16_t* __restrict__ producer_sums) {
++    static_assert(THREADS % 32 == 0 && 32 % Q4K_LPR == 0, "keep warp and row reductions intact");
+     if ((int) blockIdx.y < sd_rows) {
+-        shexp_down_blocks<TT>(sd, blockIdx.y * gridDim.x + blockIdx.x, sd_rows * gridDim.x);
++        shexp_down_blocks<TT, THREADS>(sd, blockIdx.y * gridDim.x + blockIdx.x, sd_rows * gridDim.x);
+         return;
+     }
+     const int ji = blockIdx.y - sd_rows;
+@@ -101,10 +144,40 @@ __global__ void __launch_bounds__(Q4K_THREADS) k_moe_gu_q4k(MoeW w, const Job* _
+     __shared__ Job jb;
+     if (threadIdx.x == 0) jb = jobs[ji];
+     __syncthreads();
+-    const int row = blockIdx.x * Q4K_ROWS + threadIdx.x / Q4K_LPR, lane8 = threadIdx.x % Q4K_LPR;
++    // 2026-11-18 experiment: the min correction uses the same activation
++    // sum for every weight row. Reuse the exact signed integer sum, not the
++    // rounded half stored in q8_1's ds. [-4096, 4064] fits in int16_t.
++    constexpr int YB = N / 32;
++    __shared__ int16_t sums[TT * YB];
++    if constexpr (!PRODUCER_SUMS) {
++        for (int k = threadIdx.x; k < jb.n * YB; k += blockDim.x) {
++            const auto& act = y[(size_t) jb.y[k / YB] * YB + k % YB];
++            const int* a = reinterpret_cast<const int*>(act.qs);
++            int sum = 0;
++#pragma unroll
++            for (int u = 0; u < 8; ++u) sum = __dp4a(0x01010101, a[u], sum);
++            sums[k] = static_cast<int16_t>(sum);
++        }
++        __syncthreads();
++    }
++    const int row = blockIdx.x * (THREADS / Q4K_LPR) + threadIdx.x / Q4K_LPR, lane8 = threadIdx.x % Q4K_LPR;
+     const bool live = row < w.nrows;
++    if constexpr (SINGLE_JOB) {
++        // 2026-11-19: no per-token loop, output loop, or TT accumulators
++        // on single-token expert jobs. The branch is uniform across the CTA.
++        static_assert(SHORT_GROUPS && !TWIN && !PRODUCER_SUMS);
++        if (jb.n == 1) {
++            float acc = 0.f;
++            if (live) q4k_row<1, true, false, false, true>(
++                moe_expert(w, jb.w) + (size_t) row * w.row_a, lane8, 1, y, jb.y, YB, &acc, sums);
++            job_store<Q4K_LPR, 1>(&acc, 1, live, row, jb.out, out, w.nrows);
++            return;
++        }
++    }
+     float tmp[TT] = {};
+-    if (live) q4k_row<TT>(moe_expert(w, jb.w) + (size_t) row * w.row_a, lane8, jb.n, y, jb.y, N / 32, tmp);
++    if (live)
++        q4k_row<TT, true, TWIN, PRODUCER_SUMS, SHORT_GROUPS>(moe_expert(w, jb.w) + (size_t) row * w.row_a, lane8, jb.n, y, jb.y, YB, tmp,
++                                             PRODUCER_SUMS ? producer_sums : sums, tq, td);
+     job_store<Q4K_LPR, TT>(tmp, jb.n, live, row, jb.out, out, w.nrows);
+ }
+ 
+@@ -127,30 +200,77 @@ __global__ void __launch_bounds__(Q4K_THREADS) k_moe_gu_q4k_big(MoeW w, const Bi
+ }
+ 
+ void gu_q4k_launch(int T, const MoeW& w, const Job* jobs, const int* njobs, int njobs_max, const block_q8_1* y, float* out,
+-                   cudaStream_t s, const ShexpDown& sd = ShexpDown{}) {
++                   cudaStream_t s, const ShexpDown& sd = ShexpDown{}, const int16_t* producer_sums = nullptr) {
+     if (w.ncols != N || w.row_a != (size_t) N / 256 * 144) throw std::runtime_error("moe gate|up q4_K: row layout");
+     const int gx = (w.nrows + Q4K_ROWS - 1) / Q4K_ROWS, sd_blocks = (sd.rows + Q8S_THREADS / 32 - 1) / (Q8S_THREADS / 32);
+     const int sd_rows = sd.rows ? (sd_blocks + gx - 1) / gx : 0;
+     const dim3 grid(gx, njobs_max + sd_rows);
++    int8_t* tq = nullptr;
++    float* td = nullptr;
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++    static const bool twin = env_flag("FNX_RM400_Q4K_TWIN");
++    if (twin && T <= 8) twin_of(y, N, tq, td);
++#endif
++    auto launch = [&](auto tag) {
++        constexpr int TT = decltype(tag)::value;
++        if constexpr (FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3) {
++            if (producer_sums) {
++                k_moe_gu_q4k<TT, false, true><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows, nullptr, nullptr, producer_sums);
++                return;
++            }
++        }
++        if constexpr (FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3 && TT <= 8) {
++            if (tq) {
++                k_moe_gu_q4k<TT, true><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows, tq, td, nullptr);
++                return;
++            }
++            if constexpr (TT >= 3) {
++                static const bool short_groups = env_flag("FNX_RM400_Q4K_SHORT_GROUPS");
++                if (short_groups) {
++                    static const bool single_job = env_flag("FNX_RM400_Q4K_SINGLE_JOB");
++                    // 2026-11-19: test scheduling granularity on the
++                    // same quantization and lane-local arithmetic.
++                    static const int threads = [] {
++                        const auto n = env_int("FNX_RM400_Q4K_GATE_THREADS", Q4K_THREADS);
++                        if (n != 128 && n != 192 && n != Q4K_THREADS)
++                            throw std::runtime_error("FNX_RM400_Q4K_GATE_THREADS: expected 128, 192 or 256");
++                        return (int) n;
++                    }();
++                    auto launch_short = [&](auto tag) {
++                        constexpr int B = decltype(tag)::value;
++                        constexpr int R = B / Q4K_LPR, S = B / 32;
++                        const int x = (w.nrows + R - 1) / R, blocks = (sd.rows + S - 1) / S;
++                        const int shared_rows = (blocks + x - 1) / x;
++                        const dim3 shape(x, njobs_max + shared_rows);
++                        k_moe_gu_q4k<TT, false, false, true, false, B><<<shape, B, 0, s>>>(
++                            w, jobs, njobs, y, out, sd, shared_rows, nullptr, nullptr, nullptr);
++                    };
++                    if constexpr (TT == 4 || TT == 6 || TT == 8) {
++                        if (!single_job && threads == 128) { launch_short(std::integral_constant<int, 128>{}); return; }
++                        if (!single_job && threads == 192) { launch_short(std::integral_constant<int, 192>{}); return; }
++                    }
++                    if (single_job) {
++                        k_moe_gu_q4k<TT, false, false, true, true><<<grid, Q4K_THREADS, 0, s>>>(
++                            w, jobs, njobs, y, out, sd, sd_rows, nullptr, nullptr, nullptr);
++                        return;
++                    }
++                    k_moe_gu_q4k<TT, false, false, true><<<grid, Q4K_THREADS, 0, s>>>(
++                        w, jobs, njobs, y, out, sd, sd_rows, nullptr, nullptr, nullptr);
++                    return;
++                }
++            }
++        }
++        k_moe_gu_q4k<TT><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows, nullptr, nullptr, nullptr);
++    };
++#define FNX_Q4K_GUI(t) case t: launch(std::integral_constant<int, t>{}); break
+     switch (T) {
+-        case 1: k_moe_gu_q4k<1><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break;
+-        case 2: k_moe_gu_q4k<2><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break;
+-        case 3: k_moe_gu_q4k<3><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break;
+-        case 4: k_moe_gu_q4k<4><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break;
+-        case 5: k_moe_gu_q4k<5><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break;
+-        case 6: k_moe_gu_q4k<6><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break;
+-        case 7: k_moe_gu_q4k<7><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break;
+-        case 8: k_moe_gu_q4k<8><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break;
+-        case 9: k_moe_gu_q4k<9><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break;
+-        case 10: k_moe_gu_q4k<10><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break;
+-        case 11: k_moe_gu_q4k<11><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break;
+-        case 12: k_moe_gu_q4k<12><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break;
+-        case 13: k_moe_gu_q4k<13><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break;
+-        case 14: k_moe_gu_q4k<14><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break;
+-        case 15: k_moe_gu_q4k<15><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break;
+-        case 16: k_moe_gu_q4k<16><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break;
++        FNX_Q4K_GUI(1);  FNX_Q4K_GUI(2);  FNX_Q4K_GUI(3);  FNX_Q4K_GUI(4);
++        FNX_Q4K_GUI(5);  FNX_Q4K_GUI(6);  FNX_Q4K_GUI(7);  FNX_Q4K_GUI(8);
++        FNX_Q4K_GUI(9);  FNX_Q4K_GUI(10); FNX_Q4K_GUI(11); FNX_Q4K_GUI(12);
++        FNX_Q4K_GUI(13); FNX_Q4K_GUI(14); FNX_Q4K_GUI(15); FNX_Q4K_GUI(16);
+         default: throw std::runtime_error("moe gate|up q4_K: T out of range");
+     }
++#undef FNX_Q4K_GUI
+ }
+ 
+ }  // namespace
+diff --git a/src/prefill.cu b/src/prefill.cu
+index ca343e7..9298580 100644
+--- a/src/prefill.cu
++++ b/src/prefill.cu
+@@ -891,29 +891,62 @@ void Engine::prefill(const std::vector<int>& tokens, int after) {
+     // halves of the sets
+     const int h0 = (int) history_.size();
+     const auto tok_at = [&](int q) -> int { return q < h0 ? history_[q] : tokens[q - h0]; };
+-    const size_t nt = tokens.size(), per = (size_t) K * pf_c_;
++    const size_t nt = tokens.size();
++    size_t chunk_rows = pf_c_;   // capacity, unless the lab selects a smaller scheduling unit
++#if FNX_ARCH == 70 && !FNX_27B && FNX_NCARD == 3
++    // 2026-11-19: test the measured 4K knee without making the 16K
++    // workload take smaller chunks or shrinking any scratch buffer.
++    static const bool mid_chunks = env_flag("FNX_RM400_PF_MID_CHUNKS");
++    if (mid_chunks && pos_ == 0 && pf_c_ == 4096 && nt >= 3584 && nt <= 6144) chunk_rows = 2048;
++#endif
++    const size_t per = (size_t) K * chunk_rows;
+     // FNX_NGRAM=disk: the first pass's rows are read before anything runs to hide them (~1.6 s for 16,384 rows on this
+     // box's NVMe), so the passes start at one chunk and double: a pass hides the next one's reads while those take less
+     // than its GPU time (~0.1 ms of reads against ~0.26 ms a row), and a one-chunk pass followed by a whole one did not
+     // (2.0 s for the one chunk's 1.06)
+-    const size_t first = m_.ple_rows->mode() == PleRows::Mode::DISK ? std::min(per, (size_t) pf_c_) : per;
++    const size_t first = m_.ple_rows->mode() == PleRows::Mode::DISK ? std::min(per, chunk_rows) : per;
+     auto chunks_of = [&](size_t i0, int half, size_t span) {
+         std::vector<PfChunk> ch;
+-        for (size_t i = i0; i < std::min(nt, i0 + span); i += pf_c_) {
+-            const size_t e = std::min(nt, i + pf_c_);
++        for (size_t i = i0; i < std::min(nt, i0 + span); i += chunk_rows) {
++            const size_t e = std::min(nt, i + chunk_rows);
+             ch.push_back({std::vector<int>(tokens.begin() + i, tokens.begin() + e), e < nt ? tokens[e] : after, half * K + (int) ch.size()});
+         }
+         return ch;
+     };
++    // 2026-11-19: the first pass's RAM rows are on the critical path.
++    // Parallelize only host preparation, with disjoint output ranges and
++    // the same lookup/dequantization routine. The disk gather stays whole.
++    static const bool host_parallel = env_flag("FNX_RM400_PF_HOST_PARALLEL");
++    static const bool host_timing = env_flag("FNX_RM400_PF_HOST_TIMING");
++    const bool ram = m_.ple_rows->mode() == PleRows::Mode::RAM;
+     auto embed = [&](size_t i0, const std::vector<PfChunk>& ch) {
+         size_t i = i0;
+         for (const PfChunk& c : ch) {
+-            embed_rows(h0 + (int) i, (int) c.tokens.size(), tok_at, pf_emb_[c.set], pf_ple_[c.set]);
++            const int begin = h0 + (int) i, n = (int) c.tokens.size();
++            float* const emb = pf_emb_[c.set];
++            float* const ple = pf_ple_[c.set];
++            if (host_parallel && ram && i0 == 0 && n >= 256) {
++                const auto prepare = [&](int part) {
++                    const int lo = part * n / 4, hi = (part + 1) * n / 4;
++                    embed_rows(begin + lo, hi - lo, tok_at, emb + (size_t) lo * N, ple + (size_t) lo * N);
++                };
++                // Destroy/join futures before the callable on any exception.
++                std::future<void> workers[3];
++                for (int w = 0; w < 3; ++w) workers[w] = std::async(std::launch::async, prepare, w);
++                prepare(3);
++                for (auto& worker : workers) worker.get();
++            } else {
++                embed_rows(begin, n, tok_at, emb, ple);
++            }
+             i += c.tokens.size();
+         }
+     };
+     std::vector<PfChunk> ch = chunks_of(0, 0, first);
++    const auto embed_begin = std::chrono::steady_clock::now();
+     embed(0, ch);
++    if (host_timing)
++        std::fprintf(stderr, "prefill host first pass: %zu rows, %.3f ms\n", std::min(nt, first),
++                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - embed_begin).count());
+     for (size_t i = 0, k = 0, span = first, grown = 0; i < nt; i += span, span = grown, ++k) {
+         grown = std::min(per, 2 * span);
+         std::vector<PfChunk> next = chunks_of(i + span, (int) ((k + 1) & 1), grown);
+diff --git a/src/qsa.cuh b/src/qsa.cuh
+index 529f738..99e5378 100644
+--- a/src/qsa.cuh
++++ b/src/qsa.cuh
+@@ -97,13 +97,13 @@ __global__ void __launch_bounds__(QSA_DIM) k_idx_pool(const __half* ring, int ri
+ 
+ // k_idx_prep and k_idx_pool in one launch: parts 0 .. QSA_HEADS as k_idx_prep's, part QSA_HEADS + 1 k_idx_pool's, which
+ // takes the window's own raw keys from y (rounded to f16 as the ring holds them) and the earlier ones from the ring
+-__global__ void __launch_bounds__(QSA_DIM) k_idx_prep_pool(const float* __restrict__ y, const float* __restrict__ qn,
+-                                                           const float* __restrict__ kn, __half* ring, int ring_rows, float* __restrict__ q,
+-                                                           __half* pooled, KvPages g, const int* pos0p, float eps, Rope base) {
+-    const int t = blockIdx.x, part = blockIdx.y, i = threadIdx.x, pos0 = *pos0p, p = pos0 + t;
++__device__ __forceinline__ void idx_prep_pool_row(const float* y, const float* qn, const float* kn, __half* ring,
++                                                 int ring_rows, float* q, __half* pooled, KvPages g, int t,
++                                                 int pos0, int offset, float eps, const Rope& base) {
++    const int part = blockIdx.y, i = threadIdx.x, p = pos0 + offset;
+     __shared__ float sh[32];
+     __shared__ float buf[QSA_DIM];
+-    const float* yt = y + (size_t) t * QSA_ROWS;
++    const float* yt = y + (size_t) offset * QSA_ROWS;
+     if (part < QSA_HEADS) {
+         q[(size_t) t * QSA_HEADS * QSA_DIM + part * QSA_DIM + i] = idx_norm_rope(yt[part * QSA_DIM + i], qn, p, eps, base, sh, buf);
+     } else if (part == QSA_HEADS) {
+@@ -123,16 +123,37 @@ __global__ void __launch_bounds__(QSA_DIM) k_idx_prep_pool(const float* __restri
+     }
+ }
+ 
++__global__ void __launch_bounds__(QSA_DIM) k_idx_prep_pool(const float* __restrict__ y, const float* __restrict__ qn,
++                                                         const float* __restrict__ kn, __half* ring, int ring_rows, float* __restrict__ q,
++                                                         __half* pooled, KvPages g, const int* pos0p, float eps, Rope base) {
++    const int t = blockIdx.x;
++    idx_prep_pool_row(y, qn, kn, ring, ring_rows, q, pooled, g, t, *pos0p, t, eps, base);
++}
++
++__global__ void __launch_bounds__(QSA_DIM) k_idx_prep_pool_lanes(const float* y, const float* qn, const float* kn, int ring_rows,
++                                                               float* q, __half* pooled, KvPages g, LaneAttPrep prep, float eps, Rope base) {
++    const int t = blockIdx.x;
++    base.tab = prep.rot[t];
++    // Pool current-segment keys from y (rounded to half), not the ring
++    // that the other blocks are concurrently updating.
++    const int first = prep.first[t], offset = t - first;
++    idx_prep_pool_row(y + (size_t) first * QSA_ROWS, qn, kn, reinterpret_cast<__half*>(prep.ring[t]), ring_rows, q, pooled,
++                      row_pages(g, prep.rows, t), t, row_pos(prep.rows, nullptr, t) - offset, offset, eps, base);
++}
++
+ // scores[t][j] for the visible blocks j of rows with more than QSA_TOP of them: a thread per block
+ __global__ void __launch_bounds__(256) k_idx_score(const float* __restrict__ q, const __half* __restrict__ pooled, KvPages g,
+                                                    float* __restrict__ scores, int max_pools, const int* pos0p, LaneRows lr) {
+     const int t = blockIdx.y, p = row_pos(lr, pos0p, t), nv = (p + 1) / QSA_POOL;
+-    if (nv <= QSA_TOP) return;
++    // 2026-11-18: the graph sizes the grid for the configured context.
++    // An entirely invisible tile doesn't need the query or the page table.
++    const int j0 = blockIdx.x * blockDim.x;
++    if (nv <= QSA_TOP || j0 >= nv) return;
+     g = row_pages(g, lr, t);
+     __shared__ float qs[QSA_HEADS * QSA_DIM];
+     for (int k = threadIdx.x; k < QSA_HEADS * QSA_DIM; k += blockDim.x) qs[k] = q[(size_t) t * QSA_HEADS * QSA_DIM + k];
+     __syncthreads();
+-    const int j = blockIdx.x * blockDim.x + threadIdx.x;
++    const int j = j0 + threadIdx.x;
+     if (j >= nv) return;
+     const uint4* kr = reinterpret_cast<const uint4*>(pooled + kvp_block(g, j));
+     float d[QSA_HEADS] = {};
+@@ -155,6 +176,51 @@ __global__ void __launch_bounds__(256) k_idx_score(const float* __restrict__ q,
+     scores[(size_t) t * max_pools + j] = s;
+ }
+ 
++// 2026-11-18: consecutive decode rows share their paged keys. Take two
++// rows per CTA, but keep each dot's serial FP32 accumulation exactly.
++__global__ void __launch_bounds__(256) k_idx_score_pair(const float* __restrict__ q, const __half* __restrict__ pooled, KvPages g,
++                                                       float* __restrict__ scores, int max_pools, const int* pos0p, int T) {
++    constexpr int Q = QSA_HEADS * QSA_DIM;
++    const int t0 = blockIdx.y * 2, t1 = min(t0 + 1, T - 1);
++    const int p = *pos0p, nv0 = (p + t0 + 1) / QSA_POOL, nv1 = (p + t1 + 1) / QSA_POOL;
++    const int off = blockIdx.x * blockDim.x;
++    if (nv1 <= QSA_TOP || off >= nv1) return;
++    __shared__ float qs[2][Q];
++    for (int k = threadIdx.x; k < Q; k += blockDim.x) {
++        qs[0][k] = q[(size_t) t0 * Q + k];
++        qs[1][k] = q[(size_t) t1 * Q + k];
++    }
++    __syncthreads();
++    const int j = off + threadIdx.x;
++    if (j >= nv1) return;
++    const uint4* kr = reinterpret_cast<const uint4*>(pooled + kvp_block(g, j));
++    float d[2][QSA_HEADS] = {};
++#pragma unroll 4
++    for (int c = 0; c < QSA_DIM / 8; ++c) {
++        const uint4 u = kr[c];
++        const __half2* h2 = reinterpret_cast<const __half2*>(&u);
++#pragma unroll
++        for (int k = 0; k < 4; ++k) {
++            const float2 kv = __half22float2(h2[k]);
++            const int dim = c * 8 + 2 * k;
++#pragma unroll
++            for (int r = 0; r < 2; ++r)
++#pragma unroll
++                for (int h = 0; h < QSA_HEADS; ++h)
++                    d[r][h] = fmaf(qs[r][h * QSA_DIM + dim], kv.x, fmaf(qs[r][h * QSA_DIM + dim + 1], kv.y, d[r][h]));
++        }
++    }
++    const float w = rsqrtf((float) QSA_DIM);
++    float s0 = 0.f, s1 = 0.f;
++#pragma unroll
++    for (int h = 0; h < QSA_HEADS; ++h) {
++        s0 += fmaxf(d[0][h], 0.f) * w;
++        s1 += fmaxf(d[1][h], 0.f) * w;
++    }
++    if (nv0 > QSA_TOP && j < nv0) scores[(size_t) t0 * max_pools + j] = s0;
++    if (t1 != t0) scores[(size_t) t1 * max_pools + j] = s1;
++}
++
+ // the same for a prompt's rows on the tensor cores: a block takes 16 rows (their 4 heads: 64 rows of q, in f16 high and
+ // low halves) against 64 blocks' keys (f16 already), f32 accumulation; each key is read once per 16 rows instead of once
+ // per row. Columns past a row's visible blocks get scores too (the select reads only the visible ones)
+@@ -214,6 +280,33 @@ __global__ void __launch_bounds__(256) k_idx_score_tc(const float* __restrict__
+ // into cells[t] (n_cells[t] of them), or n_cells[t] = -1 when every visible block is kept (dense). A block per row: a radix select of the QSA_TOP-th highest score (scores >= 0: their bits
+ // order as unsigned), then the blocks above it and the first ties by index, in index order, then the tail.
+ constexpr int QSA_SEL_THREADS = 1024;
++
++// 2026-11-18: each warp scans its own count; a warp-total prefix
++// gives the exact block-wide offset without a block barrier per bit.
++__device__ __forceinline__ int qsa_exclusive_count(int count, int* warp_totals) {
++    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
++    int sum = count;
++#pragma unroll
++    for (int d = 1; d < 32; d <<= 1) {
++        int prev = __shfl_up_sync(0xffffffffu, sum, d);
++        if (lane >= d) sum += prev;
++    }
++    if (lane == 31) warp_totals[warp] = sum;
++    __syncthreads();
++    if (warp == 0) {
++        int total = warp_totals[lane], own = total;
++#pragma unroll
++        for (int d = 1; d < 32; d <<= 1) {
++            int prev = __shfl_up_sync(0xffffffffu, total, d);
++            if (lane >= d) total += prev;
++        }
++        warp_totals[lane] = total - own;
++    }
++    __syncthreads();
++    return sum - count + warp_totals[warp];
++}
++
++template <int STRIPES = 1>
+ __global__ void __launch_bounds__(QSA_SEL_THREADS) k_idx_select(const float* __restrict__ scores, int* __restrict__ cells,
+                                                                 int* __restrict__ n_cells, int max_pools, const int* pos0p,
+                                                                 int card, LaneRows lr) {
+@@ -223,11 +316,21 @@ __global__ void __launch_bounds__(QSA_SEL_THREADS) k_idx_select(const float* __r
+         return;
+     }
+     const unsigned* key = reinterpret_cast<const unsigned*>(scores + (size_t) t * max_pools);
+-    __shared__ unsigned hist[256];
++    // 2026-11-19: keep the high-byte atomics on separate counters for
++    // different warps. Merging integer counts preserves exact rank/ties.
++    static_assert(STRIPES == 1 || STRIPES == 4);
++    __shared__ unsigned hist[STRIPES][256 + (STRIPES > 1)];
+     __shared__ unsigned prefix_s, want_s;
++    const int stripe = (tid >> 5) & (STRIPES - 1);
++    const auto bin_count = [&](int bin) {
++        unsigned s = 0;
++#pragma unroll
++        for (int i = 0; i < STRIPES; ++i) s += hist[i][bin];
++        return s;
++    };
+     unsigned prefix = 0, mask = 0, want = QSA_TOP;   // find the want-th largest among keys matching prefix on mask
+     for (int shift = 24; shift >= 0; shift -= 8) {
+-        for (int b = tid; b < 256; b += QSA_SEL_THREADS) hist[b] = 0;
++        for (int b = tid; b < STRIPES * 256; b += QSA_SEL_THREADS) hist[b / 256][b % 256] = 0;
+         __syncthreads();
+         // a warp's keys of one bin counted with one atomic (scores share their high bits: per key, the first pass's
+         // atomics all hit two or three bins and queue)
+@@ -237,14 +340,14 @@ __global__ void __launch_bounds__(QSA_SEL_THREADS) k_idx_select(const float* __r
+             const bool in = j < nv && (k & mask) == prefix;
+             const unsigned bin = in ? (k >> shift) & 255u : 256u;
+             const unsigned peers = __match_any_sync(0xffffffffu, bin);
+-            if (in && (tid & 31) == __ffs(peers) - 1) atomicAdd(&hist[bin], (unsigned) __popc(peers));
++            if (in && (tid & 31) == __ffs(peers) - 1) atomicAdd(&hist[stripe][bin], (unsigned) __popc(peers));
+         }
+         __syncthreads();
+         if (tid < 32) {   // the highest bin b > 0 where the count from 255 down reaches want, else 0; acc: the count above b
+             const int lane = tid, hi = 255 - 8 * lane;   // lane l: bins hi .. hi - 7
+             unsigned own = 0;
+ #pragma unroll
+-            for (int i = 0; i < 8; ++i) own += hist[hi - i];
++            for (int i = 0; i < 8; ++i) own += bin_count(hi - i);
+             unsigned before = own;   // inclusive scan over the lanes (higher bins first), then exclusive
+ #pragma unroll
+             for (int o = 1; o < 32; o <<= 1) {
+@@ -259,11 +362,12 @@ __global__ void __launch_bounds__(QSA_SEL_THREADS) k_idx_select(const float* __r
+                 int b = hi - 7;
+                 for (int i = 0; i < 8; ++i) {
+                     const int bb = hi - i;
+-                    if (bb == 0 || acc + hist[bb] >= want) {
++                    const unsigned count = bin_count(bb);
++                    if (bb == 0 || acc + count >= want) {
+                         b = bb;
+                         break;
+                     }
+-                    acc += hist[bb];
++                    acc += count;
+                 }
+                 prefix_s = prefix | ((unsigned) b << shift);
+                 want_s = want - acc;
+@@ -278,26 +382,15 @@ __global__ void __launch_bounds__(QSA_SEL_THREADS) k_idx_select(const float* __r
+     // prefix: the threshold key; `want` ties at it are kept (the first by index). Contiguous chunks per thread
+     const unsigned thr = prefix;
+     const int chunk = (nv + QSA_SEL_THREADS - 1) / QSA_SEL_THREADS, j0 = min(nv, tid * chunk), j1 = min(nv, j0 + chunk);
+-    int n_gt = 0, n_eq = 0;
++    int n_eq = 0;
+     for (int j = j0; j < j1; ++j) {
+         const unsigned k = key[j];
+-        n_gt += k > thr;
+         n_eq += k == thr;
+     }
+-    __shared__ int s_gt[QSA_SEL_THREADS], s_eq[QSA_SEL_THREADS];
+-    s_gt[tid] = n_gt;
+-    s_eq[tid] = n_eq;
+-    __syncthreads();
+-    // exclusive scans (Hillis-Steele over the block)
+-    for (int o = 1; o < QSA_SEL_THREADS; o <<= 1) {
+-        const int a = tid >= o ? s_gt[tid - o] : 0, e = tid >= o ? s_eq[tid - o] : 0;
+-        __syncthreads();
+-        s_gt[tid] += a;
+-        s_eq[tid] += e;
+-        __syncthreads();
+-    }
++    static_assert(QSA_SEL_THREADS == 32 * 32, "one warp scans all warp totals");
++    __shared__ int equal_totals[QSA_SEL_THREADS / 32], owned_totals[QSA_SEL_THREADS / 32];
+     // which blocks of the chunk are taken (ties: the first `want` by index), then how many of them this card owns
+-    const int eq_start = s_eq[tid] - n_eq;
++    const int eq_start = qsa_exclusive_count(n_eq, equal_totals);
+     int own = 0;
+     {
+         int eq_before = eq_start;
+@@ -308,16 +401,7 @@ __global__ void __launch_bounds__(QSA_SEL_THREADS) k_idx_select(const float* __r
+             own += take && kv_card(j) == card;
+         }
+     }
+-    __syncthreads();
+-    s_gt[tid] = own;
+-    __syncthreads();
+-    for (int o = 1; o < QSA_SEL_THREADS; o <<= 1) {
+-        const int a = tid >= o ? s_gt[tid - o] : 0;
+-        __syncthreads();
+-        s_gt[tid] += a;
+-        __syncthreads();
+-    }
+-    int out = s_gt[tid] - own;   // owned selected blocks before this chunk
++    int out = qsa_exclusive_count(own, owned_totals);
+     int* row = cells + (size_t) t * QSA_MAXSEL;
+     {
+         int eq_before = eq_start;
+diff --git a/src/session.cpp b/src/session.cpp
+index 8439f29..8f07034 100644
+--- a/src/session.cpp
++++ b/src/session.cpp
+@@ -1,3 +1,8 @@
++// 2026-11-19: an opt-in exact SIMD search for long speculative lookups.
++#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
++#include <immintrin.h>
++#endif
++
+ #include "session.hpp"
+ #include "env.hpp"
+ 
+@@ -374,19 +379,53 @@ std::vector<int> Session::lookup(const std::vector<int>& ctx, int d1) const { re
+ 
+ // A window's cost grows with its rows (Q4: 8 rows ~20 ms, 16 ~34): in a run being copied (a code edit) the match is long
+ // and the drafts are kept, a short match (new code) is mostly a coincidence
++#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
++__attribute__((target("avx2")))
++static size_t lookup_latest_avx2(const int* ctx, size_t n) {
++    static_assert(LOOKUP_N == 3);
++    const __m256i a = _mm256_set1_epi32(ctx[n]), b = _mm256_set1_epi32(ctx[n + 1]), c = _mm256_set1_epi32(ctx[n + 2]);
++    size_t end = n;
++    while (end >= 8) {
++        const size_t i = end - 8;
++        const __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ctx + i));
++        const __m256i y = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ctx + i + 1));
++        const __m256i z = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ctx + i + 2));
++        const __m256i same = _mm256_and_si256(_mm256_cmpeq_epi32(x, a),
++                             _mm256_and_si256(_mm256_cmpeq_epi32(y, b), _mm256_cmpeq_epi32(z, c)));
++        const unsigned mask = (unsigned) _mm256_movemask_ps(_mm256_castsi256_ps(same));
++        if (mask) return i + 31 - __builtin_clz(mask);
++        end = i;
++    }
++    while (end) {
++        --end;
++        if (ctx[end] == ctx[n] && ctx[end + 1] == ctx[n + 1] && ctx[end + 2] == ctx[n + 2]) return end;
++    }
++    return n;
++}
++#endif
++
+ std::vector<int> lookup_drafts(const std::vector<int>& ctx, int lk, int d1) {
+     std::vector<int> r;
+     if (lk == 0 || (int) ctx.size() <= LOOKUP_N) return r;
+     const size_t n0 = ctx.size() - LOOKUP_N;
+-    for (size_t s = n0; s-- > 0;)
+-        if (std::equal(ctx.begin() + s, ctx.begin() + s + LOOKUP_N, ctx.begin() + n0)) {
++    size_t s = n0;
++#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
++    static const bool use_avx2 = env_flag("FNX_RM400_LOOKUP_AVX2") && __builtin_cpu_supports("avx2");
++    if (use_avx2 && n0 >= 4096) {
++        s = lookup_latest_avx2(ctx.data(), n0);
++    } else
++#endif
++    {
++        for (size_t i = n0; i-- > 0;)
++            if (std::equal(ctx.begin() + i, ctx.begin() + i + LOOKUP_N, ctx.begin() + n0)) { s = i; break; }
++    }
++    if (s != n0) {
+             if (s + LOOKUP_N < ctx.size() && (d1 < 0 || ctx[s + LOOKUP_N] == d1)) {
+                 int m = LOOKUP_N;
+                 while (m < lk && (size_t) (m - LOOKUP_N) < s && ctx[s - 1 - (m - LOOKUP_N)] == ctx[n0 - 1 - (m - LOOKUP_N)]) ++m;
+                 const int k = std::min(lk, std::max(LOOKUP_MIN, m));
+                 r.assign(ctx.begin() + s + LOOKUP_N, ctx.begin() + std::min(ctx.size(), s + LOOKUP_N + k));
+             }
+-            break;
+         }
+     // an image cell is never a draft (nor anything after it)
+     r.erase(std::find_if(r.begin(), r.end(), [](int t) { return t >= Engine::IMAGE_TOK; }), r.end());
+diff --git a/tools/fnx_run.cpp b/tools/fnx_run.cpp
+index 0230163..80edafb 100644
+--- a/tools/fnx_run.cpp
++++ b/tools/fnx_run.cpp
+@@ -167,10 +167,15 @@ static int run_logits(fnx::Model& m, fnx::Engine& e, const char* prompt_path, co
+             if (i + w.size() == feed.size()) put_rows(e.last_logits((int) w.size()), vocab, (int) w.size() - 1, (int) w.size());
+         }
+     // the continuation in windows of T: row r of a window starting at step j gives step j + r + 1
+-    for (int j = 0; j + 1 < ns; j += T) {
++    const int requested_keep = (int) fnx::env_int("FNX_RM400_LOGITS_KEEP", T);
++    if (requested_keep < 1 || requested_keep > T) throw std::runtime_error("logits: keep must be in 1..T");
++    for (int j = 0; j + 1 < ns;) {
+         std::vector<int> w(cont.begin() + j, cont.begin() + std::min(ns - 1, j + T));
+-        e.window(w);
+-        put_rows(e.last_logits((int) w.size()), vocab, 0, (int) w.size());
++        const int keep = std::min(requested_keep, (int) w.size());
++        e.verify(w);
++        put_rows(e.last_logits((int) w.size()), vocab, 0, keep);
++        e.commit(keep);
++        j += keep;
+     }
+     if (std::ferror(out)) {
+         std::fclose(out);
+@@ -488,7 +493,12 @@ static int lab_check(fnx::Model& m, int argc, char** argv) {
+             fnx::Session s(e, K, LK, eos);
+             fnx::GenStats st;
+             s.read(prompt, st);
+-            s.generate(n, smp, [](int) {}, nullptr, st);
++            uint64_t fingerprint = 14695981039346656037ull;
++            s.generate(n, smp, [&](int tok) { fingerprint = (fingerprint ^ (uint32_t) tok) * 1099511628211ull; }, nullptr, st);
++            if (fnx::env_flag("FNX_RM400_DECODE_FINGERPRINT"))
++                std::printf("decode fingerprint=%016llx tokens=%d rounds=%d drafts=%ld/%ld\n",
++                            (unsigned long long) fingerprint, st.generated, st.rounds,
++                            st.drafts_accepted, st.drafts_offered);
+             return st;
+         };
+         auto report = [](const std::string& p, const fnx::GenStats& st) {
+@@ -668,6 +678,7 @@ static int lab_check(fnx::Model& m, int argc, char** argv) {
+         s.temperature = 0.6f, s.top_p = 0.95f, s.pen_present = 1.0f;
+         fnx::BatchDecoder dec(e, 6, 15, eos, fnx::batch_drafts());
+         const int seed0 = (int) fnx::env_int("FNX_BDECODE_SEED", 1000);   // lane r's sampling seed: seed0 + r
++        const bool fingerprint = fnx::env_flag("FNX_RM400_BATCH_FINGERPRINT");
+         for (int run = 0; run < 2; ++run) {
+             std::vector<fnx::BatchLane> bl((size_t) nl);
+             for (int r = 0; r < nl; ++r) {
+@@ -680,6 +691,7 @@ static int lab_check(fnx::Model& m, int argc, char** argv) {
+                 bl[(size_t) r].start(lanes[(size_t) r], s, std::mt19937_64(seed0 + r), p);
+             }
+             std::vector<int> got((size_t) nl, 0);
++            std::vector<uint64_t> hash((size_t) nl, 14695981039346656037ull);
+             std::vector<bool> ended((size_t) nl, false);
+             int windows = 0, rows = 0, full = 0, full_rows = 0;
+             long lane_windows = 0, full_tokens = 0;   // the windows each lane was in, summed; the tokens of windows with every lane
+@@ -697,7 +709,11 @@ static int lab_check(fnx::Model& m, int argc, char** argv) {
+                 if (ls.empty()) break;
+                 fnx::BatchDecoder::fit(ls);
+                 long emitted = 0;
+-                const auto out = dec.window(ls, limit, [&](int i, int) { ++got[(size_t) idx[(size_t) i]], ++emitted; });
++                const auto out = dec.window(ls, limit, [&](int i, int token) {
++                    const size_t lane = (size_t) idx[(size_t) i];
++                    ++got[lane], ++emitted;
++                    if (fingerprint) hash[lane] = (hash[lane] ^ (uint32_t) token) * 1099511628211ull;
++                });
+                 ms += dec.last_ms;
+                 verify_ms += dec.last_verify_ms;
+                 ++windows;
+@@ -712,6 +728,12 @@ static int lab_check(fnx::Model& m, int argc, char** argv) {
+                     if (out[i].eos) ended[(size_t) idx[i]] = true;
+             }
+             if (run == 0) continue;
++            if (fingerprint) {
++                std::printf("bdecode fingerprints:");
++                for (size_t i = 0; i < hash.size(); ++i)
++                    std::printf(" %d:%016llx", got[i], (unsigned long long) hash[i]);
++                std::printf("\n");
++            }
+             long tokens = 0, offered = 0, accepted = 0;
+             for (int r = 0; r < nl; ++r) tokens += got[(size_t) r], offered += bl[(size_t) r].offered, accepted += bl[(size_t) r].accepted;
+             std::printf("bdecode %d lanes: every lane in: %.1f tok/s, %.2f rows and %.2f ms a window (%d windows); overall %ld tokens, "
+@@ -965,10 +987,12 @@ static bool lab_mode(const std::string& mode) {
+ static bool args_ok(int argc, char** argv) {
+     const std::string mode = argc >= 3 ? argv[2] : "";
+     const bool plain = mode == "check" || mode == "gen" || mode == "rows" || mode == "bench" || mode == "bench_step" || mode == "mtp" ||
+-                       mode == "spec" || mode == "logits";
++                       mode == "spec" || mode == "logits" ||
++                       (mode == "fixed_batch_logits" && argc == 6);
+     if (lab_mode(mode) || (plain && argc >= 4)) return true;
+     std::fputs("usage: fnx_run MODEL.gguf MODE ARGS...\n"
+                "  check REF.bin OUT.bin [W] | gen REF.bin N | rows REF.bin T N | bench REF.bin T N | bench_step REF.bin L N C [step]\n"
++               "  fixed_batch_logits REF.bin WINDOWS CONTEXT\n"
+                "  mtp RT_DIR REF.bin N K [VOCAB [LK]] | spec REF.bin GEN.txt K [BAD%] | logits PROMPT.bin CONT.lgr T OUT.lgr\n"
+                "  exact [NAME] | read N [N...] | decode [N] [K] [LK] [SAMPLES] | bdecode [LANES] [N] [PROMPTS] | cache2 | batch [GEN] | compare REF.lgr OTHER.lgr\n",
+                stderr);
+@@ -1236,6 +1260,55 @@ extern "C" int fnx_run_cmd(fnx::Model* model, int argc, char** argv) {
+                     "%zu of %zu tokens match the reference\n", K, bad * 100, windows, got.size() - 1,
+                     (got.size() - 1.0) / windows, ms / windows, (got.size() - 1.0) * 1000.0 / ms, same, got.size());
+         return same == got.size() ? 0 : 1;
++    } else if (mode == "fixed_batch_logits") {
++        // 2026-11-19: attribute a sampled batch mismatch without
++        // letting the adaptive planner or RNG change the inputs.
++        if (argc != 6 || toks.empty()) throw std::runtime_error("fixed_batch_logits: PROMPT.bin WINDOWS CONTEXT");
++        long long n = 0, nc = 0;
++        if (!fnx::parse_whole(argv[4], n) || n < 1 || n > 128 ||
++            !fnx::parse_whole(argv[5], nc) || nc < 4 || nc + n * 4 + 16 >= e.max_ctx())
++            throw std::runtime_error("fixed_batch_logits: invalid windows/context");
++        constexpr int L = 6;
++        std::vector<int> lanes{0}, used(L, 0);
++        while ((int) lanes.size() < L) lanes.push_back(e.add_lane());
++        e.warm_graphs();
++        const auto tok = [&](int r, size_t k) { return toks[(k + (size_t) 97 * r) % toks.size()]; };
++        for (int r = 0; r < L; ++r) {
++            e.use_lane(lanes[r]);
++            std::vector<int> ctx((size_t) nc + r);
++            for (size_t i = 0; i < ctx.size(); ++i) ctx[i] = tok(r, i);
++            e.prefill(ctx);
++        }
++        e.use_lane(lanes[0]);
++        for (int i = 0; i < n; ++i) {
++            std::vector<int> ids, counts, rows, keep;
++            for (int j = 0; j < L; ++j) {
++                const int r = (j + i) % L;
++                const int k = 1 + (j + i) % 3;  // 12 total, ragged and rotating
++                ids.push_back(lanes[r]);
++                counts.push_back(k);
++                keep.push_back(1 + (i + j / 2) % k);
++                for (int q = 0; q < k; ++q) rows.push_back(tok(r, (size_t) nc + r + used[r] + q));
++                used[r] += keep.back();
++            }
++            const auto next = e.verify_rows(ids, counts, rows);
++            const auto scores = e.last_logits((int) rows.size());
++            if (next.size() != rows.size() || scores.size() % rows.size() || scores.empty())
++                throw std::runtime_error("fixed_batch_logits: invalid result shape");
++            const size_t vocab = scores.size() / rows.size();
++            std::printf("fixed batch window %d:", i);
++            for (size_t row = 0; row < rows.size(); ++row) {
++                uint64_t hash = 14695981039346656037ull;
++                for (size_t j = 0; j < vocab; ++j) {
++                    uint32_t word;
++                    std::memcpy(&word, &scores[row * vocab + j], sizeof word);
++                    hash = (hash ^ word) * 1099511628211ull;
++                }
++                std::printf(" %d:%016llx", next[row], (unsigned long long) hash);
++            }
++            std::printf("\n");
++            e.commit_rows(keep);
++        }
+     } else if (mode == "bench_step") {
+         // what a window costs by its rows, at a context of C tokens of the prompt (read through the prompt path) on every
+         // lane: verify windows of 1..MAXT rows on one lane, then batched windows (step: one row per lane) on 1..L lanes
+@@ -1243,6 +1316,9 @@ extern "C" int fnx_run_cmd(fnx::Model* model, int argc, char** argv) {
+         if (argc < 7) { std::fprintf(stderr, "bench_step needs L N C [step]\n"); return 2; }
+         const bool step_only = argc > 7 && std::string(argv[7]) == "step";   // only batched windows of all L lanes
+         const int L = std::atoi(argv[4]), n = std::atoi(argv[5]), nc = std::atoi(argv[6]);
++        const auto start = fnx::env_int("FNX_RM400_BENCH_TOKEN_OFFSET", 0);
++        if (start < 0 || (size_t) start >= toks.size()) throw std::runtime_error("bench_step: invalid token offset");
++        const auto token_at = [&](int i) { return toks[((size_t) start + i) % toks.size()]; };
+         std::vector<int> lanes{0};
+         while ((int) lanes.size() < L) lanes.push_back(e.add_lane());
+         e.warm_graphs();   // every lane's rotary table, as sfnx does after adding its lanes
+@@ -1250,9 +1326,9 @@ extern "C" int fnx_run_cmd(fnx::Model* model, int argc, char** argv) {
+         for (int r = 0; r < L; ++r) {
+             e.use_lane(lanes[r]);
+             std::vector<int> ctx(nc);
+-            for (int i = 0; i < nc; ++i) ctx[i] = toks[(i + 97 * r) % toks.size()];
++            for (int i = 0; i < nc; ++i) ctx[i] = token_at(i + 97 * r);
+             e.prefill(ctx);
+-            x[r] = toks[(nc + 97 * r) % toks.size()];
++            x[r] = token_at(nc + 97 * r);
+         }
+         if (n < 2) { std::fprintf(stderr, "bench_step: N 2 or more (the first window captures the graph and is not timed)\n"); return 2; }
+         e.use_lane(0);
+@@ -1271,15 +1347,37 @@ extern "C" int fnx_run_cmd(fnx::Model* model, int argc, char** argv) {
+             const std::vector<int> use(lanes.begin(), lanes.begin() + k);
+             std::vector<int> xk(x.begin(), x.begin() + k);
+             std::vector<double> wall, gpu;
++            const bool fingerprint = fnx::env_flag("FNX_RM400_BATCH_FINGERPRINT");
++            uint64_t hash = 14695981039346656037ull;
+             for (int i = 0; i < n; ++i) {
+                 xk = e.step(use, xk);
++                if (fingerprint)
++                    for (int token : xk) hash = (hash ^ (uint32_t) token) * 1099511628211ull;
+                 if (i > 0) wall.push_back(e.last_ms), gpu.push_back(e.last_gpu_ms);
+             }
+             std::fprintf(stderr, "step, %d lanes, 1 row each: wall %.3f ms, gpu %.3f ms\n", k, median(wall), median(gpu));
++            if (fingerprint) std::printf("step fingerprint=%016llx\n", (unsigned long long) hash);
++        }
++        // 2026-11-19: use the upstream decode/prompt tally format on
++        // synthetic lab inputs. No server request data is needed.
++        if (const char* path = std::getenv("FNX_ROUTE_FILE")) {
++            const auto tally = e.route_counts();
++            if (tally.size() != (size_t) 2 * fnx::NL * fnx::NEXP)
++                throw std::runtime_error("bench_step route tallies: enable FNX_ROUTE_COUNT=1");
++            std::FILE* f = std::fopen(path, "wbx");
++            if (!f) throw std::runtime_error("bench_step: cannot create route tally file");
++            const size_t written = std::fwrite(tally.data(), sizeof(unsigned), tally.size(), f);
++            const int close_rc = std::fclose(f);
++            if (written != tally.size() || close_rc)
++                throw std::runtime_error("bench_step: incomplete route tally file");
+         }
+     } else if (mode == "bench") {
+         if (argc < 6) { std::fprintf(stderr, "bench needs T N\n"); return 2; }
+         const int T = std::atoi(argv[4]), n = std::atoi(argv[5]);
++        if (fnx::env_flag("FNX_RM400_FIRST_SNAPSHOT")) e.bench_first_snapshot();
++        const int keep = (int) fnx::env_int("FNX_RM400_BENCH_KEEP", 1);
++        if (keep < 1 || keep > T) throw std::runtime_error("bench: keep must be in 1..T");
++        uint64_t fingerprint = 14695981039346656037ull;
+         // FNX_BENCH_CTX=N: the windows at a context of N tokens (the prompt repeated, read through the prompt path)
+         if (std::getenv("FNX_BENCH_CTX")) {
+             const int nc = (int) fnx::env_int("FNX_BENCH_CTX", 0);
+@@ -1288,16 +1386,18 @@ extern "C" int fnx_run_cmd(fnx::Model* model, int argc, char** argv) {
+             e.prefill(ctx);
+         }
+         std::vector<double> wall, gpu;
++        const auto t0 = std::chrono::steady_clock::now();
+         for (int i = 0; i < n; ++i) {
+             std::vector<int> w;
+-            for (int t = 0; t < T; ++t) w.push_back(toks[(i + t) % toks.size()]);
+-            e.verify(w);
++            for (int t = 0; t < T; ++t) w.push_back(toks[((size_t) i * keep + t) % toks.size()]);
++            for (int token : e.verify(w)) fingerprint = (fingerprint ^ (uint32_t) token) * 1099511628211ull;
+             if (i > 0) {   // the first window of a T captures its graph
+                 wall.push_back(e.last_ms);
+                 gpu.push_back(e.last_gpu_ms);
+             }
+-            e.commit(1);
++            e.commit(keep);
+         }
++        const double elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+         auto stats = [](std::vector<double> v, double& med, double& trim) {
+             med = median(v);
+             std::sort(v.begin(), v.end());
+@@ -1311,6 +1411,8 @@ extern "C" int fnx_run_cmd(fnx::Model* model, int argc, char** argv) {
+         stats(gpu, gm, gt);
+         std::printf("bench %d windows of %d rows: wall median %.3f trimmed %.3f ms, gpu median %.3f trimmed %.3f ms\n", n - 1, T, wm, wt,
+                     gm, gt);
++        std::printf("bench top1 fingerprint=%016llx keep=%d loop %.3f ms/window\n",
++                    (unsigned long long) fingerprint, keep, elapsed / n);
+     } else if (mode == "rows") {
+         if (argc < 6) { std::fprintf(stderr, "rows needs T N\n"); return 2; }
+         const int T = std::atoi(argv[4]), n = std::atoi(argv[5]);
