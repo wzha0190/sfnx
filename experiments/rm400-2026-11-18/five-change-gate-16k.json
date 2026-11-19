@@ -1,0 +1,99 @@
+{
+  "target": "16K/decode_tok_s",
+  "measured_gain_percent": 2.686,
+  "required_gain_percent": 3,
+  "deltas_percent": {
+    "512": {
+      "decode_tok_s": 1.805,
+      "prefill_tok_s": -0.328,
+      "ttft_s": -0.308
+    },
+    "4K": {
+      "decode_tok_s": 2.523,
+      "prefill_tok_s": 0.25,
+      "ttft_s": 0.235
+    },
+    "16K": {
+      "decode_tok_s": 2.686,
+      "prefill_tok_s": -0.02,
+      "ttft_s": -0.013
+    }
+  },
+  "regressions": [
+    "512/prefill_tok_s",
+    "512/ttft_s",
+    "16K/prefill_tok_s",
+    "16K/ttft_s"
+  ],
+  "different_response_hashes": [],
+  "performance_gate_pass": false,
+  "response_hash_gate_pass": true,
+  "full_acceptance": "not evaluated by this tool",
+  "paired_passes": [
+    {
+      "target": "16K/decode_tok_s",
+      "measured_gain_percent": 2.715,
+      "required_gain_percent": 3,
+      "deltas_percent": {
+        "512": {
+          "decode_tok_s": 1.696,
+          "prefill_tok_s": -0.408,
+          "ttft_s": -0.381
+        },
+        "4K": {
+          "decode_tok_s": 2.428,
+          "prefill_tok_s": 0.33,
+          "ttft_s": 0.31
+        },
+        "16K": {
+          "decode_tok_s": 2.715,
+          "prefill_tok_s": -0.02,
+          "ttft_s": -0.022
+        }
+      },
+      "regressions": [
+        "512/prefill_tok_s",
+        "512/ttft_s",
+        "16K/prefill_tok_s",
+        "16K/ttft_s"
+      ],
+      "different_response_hashes": [],
+      "performance_gate_pass": false,
+      "response_hash_gate_pass": true,
+      "full_acceptance": "not evaluated by this tool"
+    },
+    {
+      "target": "16K/decode_tok_s",
+      "measured_gain_percent": 2.656,
+      "required_gain_percent": 3,
+      "deltas_percent": {
+        "512": {
+          "decode_tok_s": 1.914,
+          "prefill_tok_s": -0.247,
+          "ttft_s": -0.236
+        },
+        "4K": {
+          "decode_tok_s": 2.618,
+          "prefill_tok_s": 0.17,
+          "ttft_s": 0.159
+        },
+        "16K": {
+          "decode_tok_s": 2.656,
+          "prefill_tok_s": -0.02,
+          "ttft_s": -0.003
+        }
+      },
+      "regressions": [
+        "512/prefill_tok_s",
+        "512/ttft_s",
+        "16K/prefill_tok_s",
+        "16K/ttft_s"
+      ],
+      "different_response_hashes": [],
+      "performance_gate_pass": false,
+      "response_hash_gate_pass": true,
+      "full_acceptance": "not evaluated by this tool"
+    }
+  ],
+  "recorded_passes_per_profile": 2
+}
